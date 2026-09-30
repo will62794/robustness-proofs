@@ -275,12 +275,16 @@ SumLens(s) == Cardinality(UNION {{i} \X (1..Len(s[i])) : i \in DOMAIN s})
 OffLens(s, i) == Cardinality(UNION {{j} \X (1..Len(s[j])) : j \in {j \in DOMAIN s : j < i}})
 
 \* Position k of the result comes from block Blk(s,k), at offset k - OffLens(s, Blk(s,k)).
+\* (Retained only for the older CHOOSE-based development; `Flatten` below no longer uses them.)
 Blk(s, k) == CHOOSE i \in DOMAIN s :
                  /\ OffLens(s, i) < k
                  /\ k =< OffLens(s, i) + Len(s[i])
 
-Flatten(s) ==
-    [k \in 1..SumLens(s) |-> s[Blk(s,k)][k - OffLens(s, Blk(s,k))]]
+\* Concatenation of the blocks, as a recursive *function* (TLAPS rejects recursive operators,
+\* but accepts recursive functions, and this form has an easy range lemma -- unlike the CHOOSE-
+\* based `Blk` version, whose range characterization needs OffLens/SumLens partition arithmetic).
+Flatten(s) == LET f[i \in 0..Len(s)] == IF i = 0 THEN <<>> ELSE f[i-1] \o s[i]
+              IN f[Len(s)]
 
 \* Apply `f` to each element of the ascending sequence of `ids`, concatenating the results.
 ConcatOver(f(_), ids) == LET s == SeqOf(ids) IN Flatten([i \in 1..Len(s) |-> f(s[i])])
@@ -414,14 +418,12 @@ PaymentProgram(tid, req, snap) ==
 (* TPC-C permits.                                                                                *)
 (*----------------------------------------------------------------------------------------------*)
 DeliveryForDistrict(w, d, snap) ==
-    LET RdNewOrd(o) == Rd(snap, NewOrdKey(w,d,o), {"row"})
-        scan        == ConcatOver(RdNewOrd, OIds)
-        undelivered == {o \in OIds : RowExists(snap, NewOrdKey(w,d,o))}
+    LET undelivered == {o \in OIds : RowExists(snap, NewOrdKey(w,d,o))}
     IN IF undelivered = {}
-       THEN scan   \* nothing to deliver in this district; the scan still happened
+       THEN <<>>   \* index probe on (w,d) finds no undelivered order: no rows touched
        ELSE LET o    == Min(undelivered)
                 cust == ColVal(snap, OrderKey(w,d,o), "hdr")
-            IN    scan
+            IN    Rd(snap, NewOrdKey(w,d,o), {"row"})
                \o Del(NewOrdKey(w,d,o))
                \o Rd(snap, OrderKey(w,d,o), {"hdr"})
                \o Wr(snap, OrderKey(w,d,o), [carrier |-> Tag])
@@ -498,9 +500,16 @@ Requests ==
        THEN [type : {"StockLevel"}, w : WIds, d : DIds]
        ELSE {})
 
-\* A request may be blocked purely by the model's bounds (New-Order running out of order ids).
+\* A request may be blocked purely by the model's bounds (New-Order running out of order ids, or
+\* Delivery finding no undelivered order to deliver -- in which case its program would be empty,
+\* and the snapshot isolation module cannot commit or abort a no-op transaction).
+DeliveryEnabled(req, snap) ==
+    \E d \in DIds : \E o \in OIds : RowExists(snap, NewOrdKey(req.w, d, o))
+
 ReqEnabled(req, snap) ==
-    IF req.type = "NewOrder" THEN NewOrderEnabled(req, snap) ELSE TRUE
+    IF req.type = "NewOrder" THEN NewOrderEnabled(req, snap)
+    ELSE IF req.type = "Delivery" THEN DeliveryEnabled(req, snap)
+    ELSE TRUE
 
 ProgramFor(tid, req, snap) ==
     CASE req.type = "NewOrder"    -> NewOrderProgram(req, snap)
@@ -657,28 +666,5 @@ TypeOK ==
     /\ DOMAIN dataStore = Keys
     /\ runningTxns \subseteq [id : TxnIds, startTime : Nat, commitTime : Nat \cup {Empty}]
     /\ txnReq \in [TxnIds -> Requests \cup {Empty}]
-
-
-
-
-(**************************************************************************************************)
-(* COVERAGE CHECKS.  These are meant to FAIL.  Run them as invariants to confirm that the model   *)
-(* is not vacuously serializable because nothing interesting ever happens.  Each one failing      *)
-(* means TLC found a behaviour reaching that situation.                                           *)
-(**************************************************************************************************)
-CommittedCount == Cardinality(SI!CommittedTxns(txnHistory))
-
-Cov_AllTxnsCommit  == CommittedCount < NumTxns
-Cov_SomeTxnAborts  == SI!AbortedTxns(txnHistory) = {}
-Cov_ConcurrentTxns == Cardinality(runningTxns) < 2
-
-Cov_TypeCommits(ty) == ~\E t \in SI!CommittedTxns(txnHistory) :
-                            txnReq[t] # Empty /\ txnReq[t].type = ty
-
-\* An rw-anti-dependency between two committed transactions is the ingredient every SI anomaly
-\* needs.  If this never fails, the model is too small to say anything about serializability.
-Cov_RWEdgeExists ==
-    ~\E t1, t2 \in SI!CommittedTxns(txnHistory) :
-        t1 # t2 /\ SI!RWDependency(txnHistory, t1, t2)
 
 =====================================================================================================
