@@ -385,7 +385,8 @@ GraphNodes(edges) == {e[1] : e \in edges} \cup {e[2] : e \in edges}
 Paths(edges) ==
     LET nodes == GraphNodes(edges)
         maxLen == Cardinality(nodes) + 1
-    IN  UNION {[1..n -> nodes] : n \in 1..maxLen}
+    IN  {p \in UNION {[1..n -> nodes] : n \in 1..maxLen} :
+            \A i \in 1..(Len(p)-1) : <<p[i], p[i+1]>> \in edges}
 
 \* A cycle exists iff some path of at least one edge returns to its starting node.
 IsCycleViaPath(edges) ==

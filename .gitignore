@@ -2,3 +2,4 @@ logs/
 states/
 .tlacache/
 .DS_Store
+*.toolbox/

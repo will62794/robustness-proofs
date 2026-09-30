@@ -274,11 +274,13 @@ SeqOf(S) ==
 SumLens(s) == Cardinality(UNION {{i} \X (1..Len(s[i])) : i \in DOMAIN s})
 OffLens(s, i) == Cardinality(UNION {{j} \X (1..Len(s[j])) : j \in {j \in DOMAIN s : j < i}})
 
+\* Position k of the result comes from block Blk(s,k), at offset k - OffLens(s, Blk(s,k)).
+Blk(s, k) == CHOOSE i \in DOMAIN s :
+                 /\ OffLens(s, i) < k
+                 /\ k =< OffLens(s, i) + Len(s[i])
+
 Flatten(s) ==
-    CHOOSE t \in Seq(UNION {{s[i][p] : p \in 1..Len(s[i])} : i \in DOMAIN s}) :
-        /\ Len(t) = SumLens(s)
-        /\ \A i \in DOMAIN s : \A p \in 1..Len(s[i]) :
-              t[OffLens(s, i) + p] = s[i][p]
+    [k \in 1..SumLens(s) |-> s[Blk(s,k)][k - OffLens(s, Blk(s,k))]]
 
 \* Apply `f` to each element of the ascending sequence of `ids`, concatenating the results.
 ConcatOver(f(_), ids) == LET s == SeqOf(ids) IN Flatten([i \in 1..Len(s) |-> f(s[i])])

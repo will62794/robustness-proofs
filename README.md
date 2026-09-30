@@ -129,6 +129,100 @@ anything, and `Serializable` holds only vacuously. Each is checked as a separate
 `Cov_AllTxnsCommit`, `Cov_SomeTxnAborts`, `Cov_ConcurrentTxns`, `Cov_RWEdgeExists`
 (`Cov_RWEdgeExists` is the important one: no rw-edge means no possible anomaly).
 
+## A machine-checked proof: `Auction_Proofs.tla`
+
+Everything above is bounded model checking. `Auction_Proofs.tla` is a complete TLAPS proof of
+
+```
+THEOREM Safety == Spec => []SerializableViaPath
+```
+
+for `Auction.tla`, under one explicit assumption:
+
+```
+ASSUME RobustMix == EnabledTxnTypes \subseteq {"StoreBid", "ViewItem"}
+```
+
+This is unbounded in every parameter — any number of items, users, and transactions — unlike
+the TLC runs, which fix 2 items and 3 transactions.
+
+The assumption is necessary, not a convenience. `RegUser` genuinely violates the property
+(`configs/auction-reguser.cfg` finds the Figure 2(d) write skew in under a second), so no
+proof of the unrestricted statement exists.
+
+```bash
+tlapm Auction_Proofs.tla      # 1041 obligations, no OMITTED steps
+```
+
+### The argument
+
+Fekete et al. rule out the "dangerous structure" — two consecutive rw-anti-dependency edges
+around a cycle. For this workload there is a more direct argument that avoids reasoning about
+cycles entirely: the MVSG carries a strictly increasing integer rank, so it is acyclic.
+
+```
+rank(t) == IF t writes anything THEN commit(t) ELSE begin(t)
+```
+
+Updaters are ranked by commit time, read-only transactions by begin time. Three properties of
+the history make every edge increase this rank:
+
+| | property | source |
+|---|---|---|
+| H1 | `begin(t) < commit(t)` | the clock ticks on both events |
+| H2 | a transaction that writes reads only keys it also writes | **the workload** |
+| H3 | two committed transactions writing a common key have disjoint lifetimes | First-Committer-Wins |
+
+The ww and wr cases are immediate. The rw case is the one write skew rides on, and it splits:
+
+- `t1` read-only — `rank(t1) = begin(t1) < commit(t2) = rank(t2)` directly from the edge.
+- `t1` an updater — `t1` read the key `t2` wrote, so by H2 it *wrote* that key too. Now H3
+  applies: the two have disjoint lifetimes, and the edge rules out `t2` finishing first, so
+  `commit(t1) =< begin(t2)`. The anti-dependency has been upgraded to a ww-style ordering.
+
+That last case is where robustness lives. An rw edge out of an updater is never really an
+anti-dependency here — First-Committer-Wins has already serialized the pair. Only read-only
+transactions emit genuine anti-dependency edges, and they have no outgoing ww or wr edges, so
+no cycle can close through one.
+
+H2 is the only clause that mentions the auction programs, and it is exactly what separates the
+two sides of the paper's analysis:
+
+- `StoreBid(i)` reads `ITEM(i)` and writes `ITEM(i)`. Its one read is of a key it writes. (The
+  `BIDS` insert uses a fresh key nobody reads.)
+- `ViewItem(i)` writes nothing, so the implication is vacuous.
+- `RegUser` **violates it**: it scans every `USERS` key but writes one. A predicate read with
+  no matching write is precisely the shape H2 forbids, and precisely why the transaction is not
+  robust.
+
+Because the two enabled programs have length 3 and 1, their operations are enumerated
+literally in the proof, so none of `ConcatOver` / `Flatten` / `SeqOf` has to be reasoned about.
+`RegUser` and `ViewUsers`, which do scan via `ConcatOver`, are excluded by `RobustMix`.
+
+### Structure
+
+| Part | Content |
+|---|---|
+| 1 | base case: the empty history is serializable |
+| 2 | generic: a graph with a strictly increasing rank has no cycle |
+| 3 | H1–H3 make every MVSG edge increase the rank |
+| 4 | the workload lemma: the auction programs satisfy H2 |
+| 5–7 | sequence infrastructure, stability lemmas, the body block `StartAndRun` appends |
+| 8–9 | the inductive invariant, and its conversion to H1–H3 |
+| 10–13 | initial state and the three actions (`StartAndRun`, `AbortTxn`, `CommitTxn`) |
+| 14 | assembly |
+
+Two notes on how the invariant is set up, both of which keep the proof tractable:
+
+- It carries `\E S : txnHistory \in Seq(S)` rather than a precise operation type. Every
+  ingredient of the graph reads the history only through its *range*, so "is a sequence" is all
+  that is needed, and no reasoning about the value domain of reads and writes is required. The
+  corresponding TPC-C development stalls on exactly this point.
+- Clauses are stated over the range of the history rather than over `SI!BeginOp` / `SI!CommitOp`.
+  Those two are `CHOOSE`s, and a `CHOOSE` over a growing set needs a uniqueness argument at
+  every step; quantifying over operations instead and converting once, at the end, keeps that
+  reasoning in one place.
+
 ## Limits
 
 - Bounded instances only. 3 transactions, 1 warehouse, 2 districts. The 1.31M-state run is
@@ -138,3 +232,5 @@ anything, and `Serializable` holds only vacuously. Each is checked as a separate
   the verdict is sound in the safe direction.
 - Aborts are modelled only as First-Committer-Wins write conflicts, matching the SI module.
   No client-initiated rollback (TPC-C's 1% New-Order rollback is not represented).
+- The TLAPS proof assumes the robust mix. The unrestricted statement is false, so this is a
+  limit of the theorem rather than of the proof.

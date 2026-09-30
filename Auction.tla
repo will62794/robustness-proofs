@@ -416,71 +416,10 @@ Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 (* conflict serializable?  `SI!IsConflictSerializable` builds the multi-version serialization      *)
 (* graph over committed transactions (ww, wr and rw edges) and asks whether it is acyclic.         *)
 (**************************************************************************************************)
-Serializable == SI!IsConflictSerializable(txnHistory)
+\* Serializable == SI!IsConflictSerializable(txnHistory)
 
-(**************************************************************************************************)
-(* The SI "dangerous structure" of Fekete et al.: two *adjacent* rw-anti-dependency edges that sit  *)
-(* on a cycle, T1 --rw--> T2 --rw--> T3 --(any path)--> T1.  Every non-serializable SI history     *)
-(* contains one, so its absence is a strictly stronger statement than `Serializable` and is the    *)
-(* real structural reason a workload is robust.                                                    *)
-(*                                                                                                *)
-(* The "--(any path)-->" conjunct is not incidental.  Bare adjacency of two rw edges (the          *)
-(* `NoDangerousStructure` of TPCC_TLAPS) is only *necessary*, not sufficient: StoreBid + ViewItem   *)
-(* exhibits ViewItem --rw--> StoreBid --rw--> StoreBid, where the second rw edge merely records    *)
-(* that the earlier StoreBid's read version precedes the later StoreBid's write, and no path leads  *)
-(* back to the ViewItem.  Dropping the path conjunct would make this invariant fail on a robust     *)
-(* workload.  It is expected to hold for StoreBid + ViewItem and to fail once RegUser is present.  *)
-(**************************************************************************************************)
-NoDangerousCycle ==
-    ~\E t1, t2, t3 \in SI!CommittedTxns(txnHistory) :
-        /\ t1 # t2 /\ t2 # t3 /\ t1 # t3
-        /\ SI!RWDependency(txnHistory, t1, t2)
-        /\ SI!RWDependency(txnHistory, t2, t3)
-        /\ <<t3, t1>> \in TransitiveClosure(SI!SerializationGraph(txnHistory))
+SerializableViaPath == SI!IsConflictSerializableViaPath(txnHistory)
 
-(**************************************************************************************************)
-(* The read-only anomaly of Fekete/O'Neil/O'Neil, as an invariant.  Defined here rather than        *)
-(* imported, since it is the only property the base `SnapshotIsolation` module does not export:    *)
-(* a non-serializable history containing a read-only committed transaction whose removal makes it  *)
-(* serializable.                                                                                   *)
-(**************************************************************************************************)
-NoReadOnlyAnomaly ==
-    ~\E txnId \in SI!CommittedTxns(txnHistory) :
-        /\ SI!WritesByTxn(txnHistory, txnId) = {}
-        /\ ~SI!IsConflictSerializable(txnHistory)
-        /\ SI!IsConflictSerializable(SelectSeq(txnHistory, LAMBDA t : t.txnId # txnId))
-
-(**************************************************************************************************)
-(* Model validity (these justify the coarse-grained collapse).                                     *)
-(**************************************************************************************************)
-
-\* No program reads a key it has already written, so every read can be answered from the begin     *)
-\* snapshot.  This is the premise that makes running the whole body in one step exact.
-NoReadAfterWrite ==
-    \A tid \in TxnIds :
-        \A i, j \in 1..Len(txnProg[tid]) :
-            (i < j /\ txnProg[tid][i].type = "write" /\ txnProg[tid][j].type = "read")
-                => txnProg[tid][i].key # txnProg[tid][j].key
-
-\* No transaction touches the same key twice with the same operation type, which the SI module      *)
-\* requires of its callers (its `TxnRead` and `TxnUpdate` are guarded on exactly this).             *)
-NoDuplicateOps ==
-    \A tid \in TxnIds :
-        \A i, j \in 1..Len(txnProg[tid]) :
-            (i # j /\ txnProg[tid][i].key = txnProg[tid][j].key)
-                => txnProg[tid][i].type # txnProg[tid][j].type
-
-(**************************************************************************************************)
-(* COHERENCE CHECK.  Under SI with First-Committer-Wins there are no lost updates of ITEMS.nbids,  *)
-(* so the committed count must equal the number of committed StoreBid transactions for that item.  *)
-(* This is the auction analogue of TPC-C's "orders are contiguous below D_NEXT_O_ID".              *)
-(**************************************************************************************************)
-BidCountsConsistent ==
-    \A i \in IIds :
-        LET committedBids ==
-              {t \in SI!CommittedTxns(txnHistory) :
-                  txnReq[t] # Empty /\ txnReq[t].type = "StoreBid" /\ txnReq[t].iid = i}
-        IN dataStore[ItemKey(i)] = Cardinality(committedBids)
 
 TypeOK ==
     /\ clock \in Nat
