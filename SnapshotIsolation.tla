@@ -338,27 +338,27 @@ Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 (* Source:                                                                                        *)
 (* https://github.com/pron/amazon-snapshot-spec/blob/master/serializableSnapshotIsolation.tla.    *)
 (**************************************************************************************************)
-FindAllNodesInAnyCycle(edges) ==
+\* FindAllNodesInAnyCycle(edges) ==
 
-    LET RECURSIVE findCycleNodes(_, _)   (* startNode, visitedSet *)
-        (* Returns a set containing all elements of some cycle starting at startNode,
-           or an empty set if no cycle is found. 
-         *)
-        findCycleNodes(node, visitedSet) ==
-            IF node \in visitedSet THEN
-                {node}  (* found a cycle, which includes node *)
-            ELSE
-                LET newVisited == visitedSet \union {node}
-                    neighbors == {to : <<from, to>> \in 
-                                           {<<from, to>> \in edges : from = node}}
-                IN  (* Explore neighbors *)
-                    UNION {findCycleNodes(neighbor, newVisited) : neighbor \in neighbors}
+\*     LET RECURSIVE findCycleNodes(_, _)   (* startNode, visitedSet *)
+\*         (* Returns a set containing all elements of some cycle starting at startNode,
+\*            or an empty set if no cycle is found. 
+\*          *)
+\*         findCycleNodes(node, visitedSet) ==
+\*             IF node \in visitedSet THEN
+\*                 {node}  (* found a cycle, which includes node *)
+\*             ELSE
+\*                 LET newVisited == visitedSet \union {node}
+\*                     neighbors == {to : <<from, to>> \in 
+\*                                            {<<from, to>> \in edges : from = node}}
+\*                 IN  (* Explore neighbors *)
+\*                     UNION {findCycleNodes(neighbor, newVisited) : neighbor \in neighbors}
                     
-        startPoints == {from : <<from, to>> \in edges}  (* All nodes with an outgoing edge *)
-    IN 
-        UNION {findCycleNodes(node, {}) : node \in startPoints}
+\*         startPoints == {from : <<from, to>> \in edges}  (* All nodes with an outgoing edge *)
+\*     IN 
+\*         UNION {findCycleNodes(node, {}) : node \in startPoints}
        
-IsCycle(edges) == FindAllNodesInAnyCycle(edges) /= {}
+\* IsCycle(edges) == FindAllNodesInAnyCycle(edges) /= {}
 
 
 (**************************************************************************************************)
@@ -465,7 +465,7 @@ SerializationGraph(history) ==
            \/ RWDependency(history, tedge[1], tedge[2])}
 
 \* The key property to verify i.e. serializability of transaction histories.
-IsConflictSerializable(h) == ~IsCycle(SerializationGraph(h))
+\* IsConflictSerializable(h) == ~IsCycle(SerializationGraph(h))
 
 \* Equivalent property using the path-based cycle check instead of the recursive one.
 IsConflictSerializableViaPath(h) == ~IsCycleViaPath(SerializationGraph(h))

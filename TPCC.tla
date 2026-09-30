@@ -152,13 +152,13 @@ HistKey(t)        == [tbl |-> "HIST",      t |-> t]
 
 RowKeys ==
     {WhKey(w)          : w \in WIds} \cup
-    {DistKey(w,d)      : <<w,d>>   \in WIds \X DIds} \cup
-    {CustKey(w,d,c)    : <<w,d,c>> \in WIds \X DIds \X CIds} \cup
+    {DistKey(e[1],e[2])          : e \in WIds \X DIds} \cup
+    {CustKey(e[1],e[2],e[3])     : e \in WIds \X DIds \X CIds} \cup
     {ItemKey(i)        : i \in IIds} \cup
-    {StockKey(w,i)     : <<w,i>>   \in WIds \X IIds} \cup
-    {OrderKey(w,d,o)   : <<w,d,o>> \in WIds \X DIds \X OIds} \cup
-    {NewOrdKey(w,d,o)  : <<w,d,o>> \in WIds \X DIds \X OIds} \cup
-    {OrdLineKey(w,d,o) : <<w,d,o>> \in WIds \X DIds \X OIds} \cup
+    {StockKey(e[1],e[2])         : e \in WIds \X IIds} \cup
+    {OrderKey(e[1],e[2],e[3])    : e \in WIds \X DIds \X OIds} \cup
+    {NewOrdKey(e[1],e[2],e[3])   : e \in WIds \X DIds \X OIds} \cup
+    {OrdLineKey(e[1],e[2],e[3])  : e \in WIds \X DIds \X OIds} \cup
     {HistKey(t)        : t \in TxnIds}
 
 ColsOf(tbl) ==
@@ -261,12 +261,24 @@ SI == INSTANCE SnapshotIsolation WITH
 Min(S) == CHOOSE x \in S : \A y \in S : x =< y
 Max(S) == CHOOSE x \in S : \A y \in S : y =< x
 
-\* A finite set of naturals as an ascending sequence.
-RECURSIVE SeqOf(_)
-SeqOf(S) == IF S = {} THEN <<>> ELSE LET m == Min(S) IN <<m>> \o SeqOf(S \ {m})
+\* A finite set of naturals as an ascending sequence.  Written without recursion (TLAPS
+\* does not support recursive operator definitions) as the unique injective, increasing
+\* enumeration of S.
+SeqOf(S) ==
+    CHOOSE s \in [1..Cardinality(S) -> S] :
+        /\ \A i, j \in DOMAIN s : s[i] = s[j] => i = j
+        /\ \A i \in 1..(Len(s) - 1) : s[i] < s[i+1]
 
-RECURSIVE Flatten(_)
-Flatten(s) == IF s = <<>> THEN <<>> ELSE Head(s) \o Flatten(Tail(s))
+\* Concatenation of a sequence of sequences, without recursion.  The result has length equal
+\* to the sum of the block lengths, and block i occupies positions OffLens(s,i)+1 .. +Len(s[i]).
+SumLens(s) == Cardinality(UNION {{i} \X (1..Len(s[i])) : i \in DOMAIN s})
+OffLens(s, i) == Cardinality(UNION {{j} \X (1..Len(s[j])) : j \in {j \in DOMAIN s : j < i}})
+
+Flatten(s) ==
+    CHOOSE t \in Seq(UNION {{s[i][p] : p \in 1..Len(s[i])} : i \in DOMAIN s}) :
+        /\ Len(t) = SumLens(s)
+        /\ \A i \in DOMAIN s : \A p \in 1..Len(s[i]) :
+              t[OffLens(s, i) + p] = s[i][p]
 
 \* Apply `f` to each element of the ascending sequence of `ids`, concatenating the results.
 ConcatOver(f(_), ids) == LET s == SeqOf(ids) IN Flatten([i \in 1..Len(s) |-> f(s[i])])
@@ -416,10 +428,9 @@ DeliveryForDistrict(w, d, snap) ==
                \o Rd(snap, CustKey(w,d,cust), {"balance"})
                \o Wr(snap, CustKey(w,d,cust), [balance |-> Tag])
 
-RECURSIVE DeliveryOverDistricts(_,_,_)
+\* Concatenate DeliveryForDistrict over the districts of `ds`, without recursion.
 DeliveryOverDistricts(w, ds, snap) ==
-    IF ds = <<>> THEN <<>>
-    ELSE DeliveryForDistrict(w, Head(ds), snap) \o DeliveryOverDistricts(w, Tail(ds), snap)
+    Flatten([i \in 1..Len(ds) |-> DeliveryForDistrict(w, ds[i], snap)])
 
 DeliveryProgram(req, snap) == DeliveryOverDistricts(req.w, SeqOf(DIds), snap)
 
@@ -563,13 +574,20 @@ Init ==
 
 Unused(tid) == ~\E op \in SI!Range(txnHistory) : op.txnId = tid
 
-\* Fold a program's writes into a snapshot, giving the transaction's final snapshot.
-RECURSIVE ApplyWrites(_,_)
+\* Fold a program's writes into a snapshot, giving the transaction's final snapshot.  Written
+\* without recursion: for each key, the value is that of the *last* write to it in `ops` (or
+\* snap[k] if there is none).  Since a program writes each key at most once, this equals the
+\* sequential fold.  LastW(k) picks the highest index of a write to k.
 ApplyWrites(snap, ops) ==
-    IF ops = <<>> THEN snap
-    ELSE LET o == Head(ops)
-             s == IF o.type = "write" THEN [snap EXCEPT ![o.key] = o.val] ELSE snap
-         IN ApplyWrites(s, Tail(ops))
+    LET LastW(k) ==
+            CHOOSE i \in DOMAIN ops :
+                ops[i].type = "write" /\ ops[i].key = k
+                /\ \A j \in DOMAIN ops : (ops[j].type = "write" /\ ops[j].key = k) => j =< i
+        WKeys == {ops[i].key : i \in DOMAIN ops}
+    IN  [k \in DOMAIN snap \cup WKeys |->
+            IF \E i \in DOMAIN ops : ops[i].type = "write" /\ ops[i].key = k
+            THEN ops[LastW(k)].val
+            ELSE snap[k]]
 
 (*----------------------------------------------------------------------------------------------*)
 (* Begin a transaction and run its whole body in one step.                                        *)
@@ -625,7 +643,7 @@ Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 (* conflict serializable?  `SI!IsConflictSerializable` builds the multi-version serialization     *)
 (* graph over committed transactions (ww, wr and rw edges) and asks whether it is acyclic.        *)
 (**************************************************************************************************)
-Serializable == SI!IsConflictSerializable(txnHistory)
+\* Serializable == SI!IsConflictSerializable(txnHistory)
 
 \* Equivalent to Serializable, but detects cycles via the path-based check
 \* (SI!IsCycleViaPath) instead of the recursive one.
