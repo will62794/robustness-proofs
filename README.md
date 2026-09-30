@@ -52,7 +52,6 @@ Flip `ColumnGranularity` in the config to reproduce either side.
 ./mk.sh col-3txn      # main result: serializable, exhaustive  (~14 min, 8 workers)
 ./mk.sh row-3txn      # counterexample                         (~1 min)
 ./mk.sh col-allmix    # all five transaction profiles
-./mk.sh fine-2txn     # fine-grained interleaving cross-check
 ```
 
 Logs land in `logs/`. `mk.sh` expects `tla2tools.jar` at `~/tla2tools.jar`.
@@ -90,9 +89,9 @@ commit times, and per-transaction read/write key sets, never from body interleav
 of reachable MVSGs is therefore identical under either granularity.
 
 The argument has one premise that is easy to get wrong, so it is checked rather than asserted:
-no TPC-C transaction reads an item it has already written (invariant `NoReadAfterWrite`).
-`SpecFine` provides genuine one-operation-per-step interleaving as an independent cross-check;
-it is only tractable at 2 transactions.
+no TPC-C transaction reads an item it has already written (invariant `NoReadAfterWrite`). A
+second check, `NoDuplicateOps`, confirms each transaction touches any given item at most once
+per operation type, so a collapsed body is still a legal SI execution.
 
 ### 3. Values are dropped unless they steer control flow
 
@@ -119,8 +118,8 @@ with a fresh row per transaction, so it can never conflict).
 
 - `NoReadAfterWrite` — justifies collapsing transaction bodies.
 - `NoDuplicateOps` — the SI module's `TxnRead`/`TxnUpdate` are guarded against repeating a
-  key; without this the fine-grained mode would deadlock and the coarse mode would silently
-  diverge from it.
+  key; this confirms each collapsed body touches any given item at most once per operation
+  type, so it stays within what those actions would permit.
 - `OrderIdsContiguous` — TPC-C Consistency Condition 3 in spirit: an order exists iff its id
   is below the district's `D_NEXT_O_ID`.
 

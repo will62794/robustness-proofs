@@ -222,11 +222,10 @@ VARIABLE txnSnapshots   \* SI: per-transaction snapshot of the store
 
 VARIABLE txnReq         \* txnId -> the TPC-C request this transaction is executing
 VARIABLE txnProg        \* txnId -> the sequence of read/write ops that request expands to
-VARIABLE txnPc          \* txnId -> index of the next op to execute (fine-grained mode only)
 
 siVars == <<clock, runningTxns, txnSnapshots, dataStore, txnHistory>>
-wlVars == <<txnReq, txnProg, txnPc>>
-vars   == <<clock, runningTxns, txnSnapshots, dataStore, txnHistory, txnReq, txnProg, txnPc>>
+wlVars == <<txnReq, txnProg>>
+vars   == <<clock, runningTxns, txnSnapshots, dataStore, txnHistory, txnReq, txnProg>>
 
 (**************************************************************************************************)
 (* Instantiate the snapshot isolation specification.  From here on, `SI!Foo` is Foo as defined in *)
@@ -526,7 +525,6 @@ Init ==
     /\ txnSnapshots = [t \in TxnIds |-> Empty]
     /\ txnReq       = [t \in TxnIds |-> Empty]
     /\ txnProg      = [t \in TxnIds |-> <<>>]
-    /\ txnPc        = [t \in TxnIds |-> 0]
 
 ----------------------------------------------------------------------------------------------------
 
@@ -534,24 +532,14 @@ Init ==
 (*                                                                                                *)
 (* Actions                                                                                        *)
 (*                                                                                                *)
-(* Two granularities of interleaving are offered, and they are expected to be equivalent for      *)
-(* serializability:                                                                               *)
-(*                                                                                                *)
-(*   FINE-GRAINED (`NextFine`) -- begin, then one read or write per step, then commit/abort.      *)
-(*     Reads and writes are literally `SI!TxnRead` and `SI!TxnUpdate`.  Most obviously faithful,  *)
-(*     but a behaviour is ~20 steps per transaction and the interleavings blow up.                *)
-(*                                                                                                *)
-(*   COARSE (`Next`, the default) -- the whole transaction body runs in one step between begin    *)
-(*     and commit.                                                                                *)
-(*                                                                                                *)
-(* Collapsing the body is not an approximation, it is exact, and here is why.  Under SI a         *)
-(* transaction's reads are answered entirely from its begin snapshot plus its own prior writes,   *)
-(* and its writes are invisible to everyone else until commit.  So the position of a body         *)
-(* operation within the interval [begin, commit] is unobservable: no other transaction's          *)
+(* `StartAndRun` begins a transaction and runs its whole body in one step; commit and abort are    *)
+(* separate steps.  Collapsing the body is not an approximation, it is exact, and here is why.    *)
+(* Under SI a transaction's reads are answered entirely from its begin snapshot plus its own      *)
+(* prior writes, and its writes are invisible to everyone else until commit.  So the position of  *)
+(* a body operation within the interval [begin, commit] is unobservable: no other transaction's   *)
 (* behaviour depends on it.  And the MVSG that decides conflict serializability is built only     *)
 (* from each transaction's begin time, commit time, read key set and write key set -- never from  *)
-(* the interleaving of body operations.  So the set of MVSGs reachable under `Next` equals the    *)
-(* set reachable under `NextFine`.                                                                *)
+(* the interleaving of body operations.                                                           *)
 (*                                                                                                *)
 (* The argument relies on one thing that is easy to get wrong, and so is checked rather than      *)
 (* assumed: no TPC-C transaction reads an item it has already written (`NoReadAfterWrite`).  If   *)
@@ -570,7 +558,7 @@ ApplyWrites(snap, ops) ==
          IN ApplyWrites(s, Tail(ops))
 
 (*----------------------------------------------------------------------------------------------*)
-(* Coarse-grained: begin a transaction and run its whole body in one step.                       *)
+(* Begin a transaction and run its whole body in one step.                                        *)
 (*                                                                                               *)
 (* The begin half is exactly `SI!StartTxn` -- snapshot the committed store, append a `begin`     *)
 (* event, join the running set, tick the clock.  It is inlined only because the body's events    *)
@@ -585,43 +573,18 @@ StartAndRun(tid, req) ==
        IN /\ txnHistory'   = txnHistory \o <<beginOp>> \o events
           /\ txnSnapshots' = [txnSnapshots EXCEPT ![tid] = ApplyWrites(dataStore, prog)]
           /\ txnProg'      = [txnProg EXCEPT ![tid] = prog]
-          /\ txnPc'        = [txnPc EXCEPT ![tid] = Len(prog) + 1]
     /\ runningTxns' = runningTxns \cup {[id |-> tid, startTime |-> clock + 1, commitTime |-> Empty]}
     /\ clock' = clock + 1
     /\ txnReq' = [txnReq EXCEPT ![tid] = req]
     /\ UNCHANGED <<dataStore>>
 
 (*----------------------------------------------------------------------------------------------*)
-(* Fine-grained: begin, then execute the program one operation at a time.                        *)
-(*----------------------------------------------------------------------------------------------*)
-StartOnly(tid, req) ==
-    /\ Unused(tid)
-    /\ ReqEnabled(req, dataStore)
-    /\ SI!StartTxn(tid)
-    /\ txnReq'  = [txnReq  EXCEPT ![tid] = req]
-    /\ txnProg' = [txnProg EXCEPT ![tid] = ProgramFor(tid, req, dataStore)]
-    /\ txnPc'   = [txnPc   EXCEPT ![tid] = 1]
-
-StepTxn(tid) ==
-    /\ tid \in SI!RunningTxnIds
-    /\ txnPc[tid] \in 1..Len(txnProg[tid])
-    /\ LET op == txnProg[tid][txnPc[tid]] IN
-        \/ /\ op.type = "read"
-           /\ SI!TxnRead(tid, op.key)
-        \/ /\ op.type = "write"
-           /\ SI!TxnUpdate(tid, op.key, op.val)
-    /\ txnPc' = [txnPc EXCEPT ![tid] = @ + 1]
-    /\ UNCHANGED <<txnReq, txnProg>>
-
-Finished(tid) == tid \in SI!RunningTxnIds /\ txnPc[tid] = Len(txnProg[tid]) + 1
-
-(*----------------------------------------------------------------------------------------------*)
 (* Commit / abort are `SI!CommitTxn` and `SI!AbortTxn` verbatim: First-Committer-Wins decides,   *)
 (* and a transaction aborts exactly when a concurrent transaction already committed a write to   *)
 (* an item it intends to write.                                                                  *)
 (*----------------------------------------------------------------------------------------------*)
-CommitTxn(tid) == Finished(tid) /\ SI!CommitTxn(tid) /\ UNCHANGED wlVars
-AbortTxn(tid)  == Finished(tid) /\ SI!AbortTxn(tid)  /\ UNCHANGED wlVars
+CommitTxn(tid) == SI!CommitTxn(tid) /\ UNCHANGED wlVars
+AbortTxn(tid)  == SI!AbortTxn(tid)  /\ UNCHANGED wlVars
 
 AllTxnsDone == \A tid \in TxnIds :
     \/ tid \in SI!CommittedTxns(txnHistory) \cup SI!AbortedTxns(txnHistory)
@@ -633,15 +596,7 @@ Next ==
     \/ \E tid \in TxnIds : AbortTxn(tid)
     \/ (AllTxnsDone /\ UNCHANGED vars)
 
-NextFine ==
-    \/ \E tid \in TxnIds, req \in Requests : StartOnly(tid, req)
-    \/ \E tid \in TxnIds : StepTxn(tid)
-    \/ \E tid \in TxnIds : CommitTxn(tid)
-    \/ \E tid \in TxnIds : AbortTxn(tid)
-    \/ (AllTxnsDone /\ UNCHANGED vars)
-
-Spec     == Init /\ [][Next]_vars     /\ WF_vars(Next)
-SpecFine == Init /\ [][NextFine]_vars /\ WF_vars(NextFine)
+Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 
 ----------------------------------------------------------------------------------------------------
 
@@ -658,59 +613,15 @@ SpecFine == Init /\ [][NextFine]_vars /\ WF_vars(NextFine)
 (**************************************************************************************************)
 Serializable == SI!IsConflictSerializable(txnHistory)
 
-(**************************************************************************************************)
-(* The "dangerous structure" of Fekete et al.: two rw-anti-dependency edges in a row.  Snapshot   *)
-(* isolation can only produce a non-serializable history if this appears, so it is the real       *)
-(* reason `Serializable` holds, and it is a strictly stronger invariant.  Checking it directly is *)
-(* the machine-checked form of the paper's static argument for TPC-C.                             *)
-(**************************************************************************************************)
-NoDangerousStructure ==
-    ~\E t1, t2, t3 \in SI!CommittedTxns(txnHistory) :
-        /\ t1 # t2 /\ t2 # t3
-        /\ SI!RWDependency(txnHistory, t1, t2)
-        /\ SI!RWDependency(txnHistory, t2, t3)
-
-\* The read-only anomaly of Fekete/O'Neil/O'Neil, as an invariant.
-NoReadOnlyAnomaly == ~SI!ReadOnlyAnomaly(txnHistory)
-
-(**************************************************************************************************)
-(* Validates the "collapse the transaction body" simplification: it is exact only because no      *)
-(* TPC-C transaction reads an item it has already written, so every read can be answered from the *)
-(* begin snapshot.  TLC checks that here rather than us asserting it.                             *)
-(**************************************************************************************************)
-NoReadAfterWrite ==
-    \A tid \in TxnIds :
-        \A i, j \in 1..Len(txnProg[tid]) :
-            (i < j /\ txnProg[tid][i].type = "write" /\ txnProg[tid][j].type = "read")
-                => txnProg[tid][i].key # txnProg[tid][j].key
-
-(**************************************************************************************************)
-(* Validates the other shortcut: no transaction touches the same item twice with the same         *)
-(* operation type, which the snapshot isolation module requires of its callers (its `TxnRead`     *)
-(* and `TxnUpdate` are guarded on exactly this).  Without it the fine-grained mode would deadlock *)
-(* and the coarse mode would silently diverge from it.                                            *)
-(**************************************************************************************************)
-NoDuplicateOps ==
-    \A tid \in TxnIds :
-        \A i, j \in 1..Len(txnProg[tid]) :
-            (i # j /\ txnProg[tid][i].key = txnProg[tid][j].key)
-                => txnProg[tid][i].type # txnProg[tid][j].type
-
-(**************************************************************************************************)
-(* A TPC-C consistency condition, as a sanity check that the workload is modelled coherently: in  *)
-(* the committed store, every order id below a district's D_NEXT_O_ID exists and none at or above *)
-(* it does.  This is TPC-C Consistency Condition 3 in spirit.                                     *)
-(**************************************************************************************************)
-OrderIdsContiguous ==
-    \A w \in WIds, d \in DIds, o \in OIds :
-        RowExists(dataStore, OrderKey(w,d,o))
-            <=> (o < ColVal(dataStore, DistKey(w,d), "nextoid"))
 
 TypeOK ==
     /\ clock \in Nat
     /\ DOMAIN dataStore = Keys
     /\ runningTxns \subseteq [id : TxnIds, startTime : Nat, commitTime : Nat \cup {Empty}]
     /\ txnReq \in [TxnIds -> Requests \cup {Empty}]
+
+
+
 
 (**************************************************************************************************)
 (* COVERAGE CHECKS.  These are meant to FAIL.  Run them as invariants to confirm that the model   *)
