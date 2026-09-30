@@ -361,6 +361,37 @@ FindAllNodesInAnyCycle(edges) ==
 IsCycle(edges) == FindAllNodesInAnyCycle(edges) /= {}
 
 
+(**************************************************************************************************)
+(* An alternative cycle check expressed directly in terms of paths, following the style of the    *)
+(* CommunityModules Graphs module (Path / HasCycle):                                              *)
+(*                                                                                                *)
+(* https://github.com/tlaplus/CommunityModules/blob/master/modules/Graphs.tla                     *)
+(*                                                                                                *)
+(* This avoids the recursive operator above.  A path is a non-empty sequence of nodes in which    *)
+(* consecutive nodes are joined by an edge; a cycle is a path that returns to its starting node.  *)
+(*                                                                                                *)
+(* Graphs.Path uses Seq(G.node) directly, but TLC cannot enumerate Seq of a non-empty set (it is  *)
+(* infinite).  Since a cycle, if one exists, can always be taken to be simple, it suffices to     *)
+(* consider paths whose length is at most the number of nodes plus one, which is finite and so    *)
+(* enumerable by TLC.                                                                             *)
+(**************************************************************************************************)
+
+\* The set of all nodes appearing as an endpoint of some edge.
+GraphNodes(edges) == {e[1] : e \in edges} \cup {e[2] : e \in edges}
+
+\* The set of all paths of a given graph, i.e. all non-empty sequences of nodes whose consecutive
+\* elements are connected by an edge. Path length is bounded by the number of nodes, which keeps
+\* the set finite without losing the ability to detect a cycle.
+Paths(edges) ==
+    LET nodes == GraphNodes(edges)
+        maxLen == Cardinality(nodes) + 1
+    IN  UNION {[1..n -> nodes] : n \in 1..maxLen}
+
+\* A cycle exists iff some path of at least one edge returns to its starting node.
+IsCycleViaPath(edges) ==
+    \E p \in Paths(edges) : Len(p) > 1 /\ p[1] = p[Len(p)]
+
+
 
 (**************************************************************************************************)
 (*                                                                                                *)
@@ -435,6 +466,9 @@ SerializationGraph(history) ==
 
 \* The key property to verify i.e. serializability of transaction histories.
 IsConflictSerializable(h) == ~IsCycle(SerializationGraph(h))
+
+\* Equivalent property using the path-based cycle check instead of the recursive one.
+IsConflictSerializableViaPath(h) == ~IsCycleViaPath(SerializationGraph(h))
 
 
 -------------------------------------------------

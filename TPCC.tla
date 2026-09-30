@@ -39,7 +39,7 @@
 (* see a counterexample in a handful of seconds.                                                  *)
 (*                                                                                                *)
 (**************************************************************************************************)
-EXTENDS Naturals, FiniteSets, Sequences, TLC
+EXTENDS Naturals, FiniteSets, Sequences
 
 (**************************************************************************************************)
 (* Scale factors.  Everything about the modelled database is derived from these.  Keep them tiny; *)
@@ -84,6 +84,20 @@ ASSUME EnabledTxnTypes \subseteq AllTxnTypes
 ASSUME InitOrders \in 0..MaxOrders
 ASSUME NewOrderItemSets \subseteq (SUBSET IIds \ {{}})
 ASSUME ColumnGranularity \in BOOLEAN
+
+(**************************************************************************************************)
+(*                                                                                                *)
+(* Generic helpers.                                                                               *)
+(*                                                                                                *)
+(* `Merge` is the TLC module's infix `@@` operator, written out here.  We do not EXTEND TLC,      *)
+(* so that the spec depends only on modules whose operators TLAPS can reason about: the TLC      *)
+(* module's operators are implemented (or overridden) by the TLC Java runtime and have no         *)
+(* useful interpretation in a proof.  This is the only thing the spec used TLC for.               *)
+(**************************************************************************************************)
+
+\* Merge two functions, with the second taking precedence on their shared domain.
+Merge(f, g) ==
+    [x \in (DOMAIN f) \cup (DOMAIN g) |-> IF x \in DOMAIN g THEN g[x] ELSE f[x]]
 
 ----------------------------------------------------------------------------------------------------
 
@@ -174,7 +188,7 @@ ColOrder == <<"tax", "ytd", "nextoid", "info", "balance", "qty", "hdr", "carrier
 SeqOfCols(S) == SelectSeq(ColOrder, LAMBDA c : c \in S)
 
 \* The unit of conflict.
-Item(base, col) == IF ColumnGranularity THEN base @@ [col |-> col] ELSE base
+Item(base, col) == IF ColumnGranularity THEN Merge(base, [col |-> col]) ELSE base
 
 Keys == IF ColumnGranularity
         THEN UNION {{Item(b, c) : c \in ColsOf(b.tbl)} : b \in RowKeys}
@@ -569,7 +583,7 @@ StartAndRun(tid, req) ==
     /\ ReqEnabled(req, dataStore)
     /\ LET prog    == ProgramFor(tid, req, dataStore)
            beginOp == [type |-> "begin", txnId |-> tid, time |-> clock + 1]
-           events  == [i \in 1..Len(prog) |-> prog[i] @@ [txnId |-> tid]]
+           events  == [i \in 1..Len(prog) |-> Merge(prog[i], [txnId |-> tid])]
        IN /\ txnHistory'   = txnHistory \o <<beginOp>> \o events
           /\ txnSnapshots' = [txnSnapshots EXCEPT ![tid] = ApplyWrites(dataStore, prog)]
           /\ txnProg'      = [txnProg EXCEPT ![tid] = prog]
@@ -612,6 +626,10 @@ Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 (* graph over committed transactions (ww, wr and rw edges) and asks whether it is acyclic.        *)
 (**************************************************************************************************)
 Serializable == SI!IsConflictSerializable(txnHistory)
+
+\* Equivalent to Serializable, but detects cycles via the path-based check
+\* (SI!IsCycleViaPath) instead of the recursive one.
+SerializableViaPath == SI!IsConflictSerializableViaPath(txnHistory)
 
 
 TypeOK ==
