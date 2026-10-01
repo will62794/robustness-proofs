@@ -44,6 +44,22 @@ EXTENDS Naturals, FiniteSets, Sequences, TLC
 (* concurrent transaction Tk has already committed writes (updates) of rows or index entries that *)
 (* Ti intends to write."                                                                          *)
 (*                                                                                                *)
+(* REPRESENTATION: A TRANSACTION BODY IS ONE EVENT                                                *)
+(*                                                                                                *)
+(* This module uses the same transaction representation as `TPCC` and `Auction`.  Conflict        *)
+(* serializability depends only on each transaction's begin time, commit time, read key set and   *)
+(* write key set -- never on the order in which its body operations execute (under SI a           *)
+(* transaction's writes are invisible until commit, and its reads see only its begin snapshot, so *)
+(* no other transaction observes the body's interleaving).  So a transaction's body is recorded   *)
+(* as a single event carrying those two sets, rather than as a sequence of individual read and    *)
+(* write events.  This removes any need for reasoning about sequence positions, and makes the     *)
+(* analysis a matter of set reasoning.                                                            *)
+(*                                                                                                *)
+(* Since this module models an *arbitrary* workload (unlike `TPCC` and `Auction`, which fix a set *)
+(* of transaction programs), the body of a transaction is chosen nondeterministically when the    *)
+(* transaction starts: any read key set and any set of writes assigning one value per written     *)
+(* key.                                                                                           *)
+(*                                                                                                *)
 (**************************************************************************************************)
 
 
@@ -64,65 +80,85 @@ CONSTANT Empty
 (* The variables of the spec.                                                                     *)
 (**************************************************************************************************)
 
-\* The clock, which measures 'time', is just a counter, that increments (ticks) 
+\* The clock, which measures 'time', is just a counter, that increments (ticks)
 \* whenever a transaction starts or commits.
 VARIABLE clock
 
 \* The set of all currently running transactions.
 VARIABLE runningTxns
 
-\* The full history of all transaction operations. It is modeled as a linear 
-\* sequence of events. Such a history would likely never exist in a real implementation, 
-\* but it is used in the model to check the properties of snapshot isolation.
+\* The full history of all transaction operations. It is modeled as a linear
+\* sequence of events: a 'begin' and a 'body' event per started transaction, and a
+\* 'commit' or 'abort' event per finished one. Such a history would likely never exist in a
+\* real implementation, but it is used in the model to check the properties of snapshot isolation.
 VARIABLE txnHistory
 
-\* (NOT NECESSARY)
-\* The key-value data store. In this spec, we model a data store explicitly, even though it is not actually
-\* used for the verification of any correctness properties. This was added initially as an attempt the make the
-\* spec more intuitive and understandable. It may play no important role at this point, however. If a property
-\* check was ever added for view serializability, this, and the set of transaction snapshots, may end up being
-\* useful.
+\* The key-value data store.
 VARIABLE dataStore
 
-\* (NOT NECESSARY)
-\* The set of snapshots needed for all running transactions. Each snapshot 
-\* represents the entire state of the data store as of a given point in time. 
-\* It is a function from transaction ids to data store snapshots. This, like the 'dataStore' variable, may 
-\* now be obsolete for a spec at this level of abstraction, since the correctness properties we check do not 
-\* depend on the actual data being read/written.
+\* The set of snapshots needed for all running transactions. Each snapshot
+\* represents the entire state of the data store as of a given point in time,
+\* adjusted to take the transaction's own writes into account. It is a function from
+\* transaction ids to data store snapshots.
 VARIABLE txnSnapshots
 
-vars == <<clock, runningTxns, txnSnapshots, dataStore, txnHistory>>
+\* txnId -> the body (reads / writes) that transaction is executing, or Empty if it
+\* has not started. Keeping the body here, as well as in the history, lets the commit
+\* and abort actions talk about a transaction's writes without searching the history.
+VARIABLE txnProg
+
+vars == <<clock, runningTxns, txnSnapshots, dataStore, txnHistory, txnProg>>
 
 
 (**************************************************************************************************)
 (* Data type definitions.                                                                         *)
+(*                                                                                                *)
+(* A body is a record with two fields: `reads`, the set of keys read, and `writes`, the set of    *)
+(* write operations (each a key together with the value written).  The MVSG itself uses only the  *)
+(* keys; values are kept so that the modelled data store is meaningful.                           *)
 (**************************************************************************************************)
 
 DataStoreType == [keys -> (values \cup {Empty})]
+
+WriteOpType   == [type : {"write"}, key : keys, val : values]
+BodyType      == [reads : SUBSET keys, writes : SUBSET WriteOpType]
+
 BeginOpType   == [type : {"begin"}  , txnId : txnIds , time : Nat]
+BodyOpType    == [type : {"body"}   , txnId : txnIds , reads : SUBSET keys, writes : SUBSET WriteOpType]
 CommitOpType  == [type : {"commit"} , txnId : txnIds , time : Nat, updatedKeys : SUBSET keys]
-WriteOpType   == [type : {"write"}  , txnId : txnIds , key: SUBSET keys , val : SUBSET values]
-ReadOpType    == [type : {"read"}   , txnId : txnIds , key: SUBSET keys , val : SUBSET values]
-AnyOpType     == UNION {BeginOpType, CommitOpType, WriteOpType, ReadOpType}
+AbortOpType   == [type : {"abort"}  , txnId : txnIds , time : Nat]
+AnyOpType     == UNION {BeginOpType, BodyOpType, CommitOpType, AbortOpType}
+
+WriteKeysOf(B) == {w.key : w \in B.writes}
+
+\* The set of all bodies a transaction may execute: any set of keys read, and any
+\* assignment of a value to each key written. Writing a key at most once per transaction
+\* loses no generality, since only the last write of a key is ever visible to anyone else.
+Bodies ==
+    LET WriteSets == UNION {[S -> values] : S \in SUBSET keys} IN
+    {[reads  |-> rd,
+      writes |-> {[type |-> "write", key |-> k, val |-> wr[k]] : k \in DOMAIN wr}] :
+        rd \in SUBSET keys, wr \in WriteSets}
 
 (**************************************************************************************************)
 (* The type invariant and initial predicate.                                                      *)
 (**************************************************************************************************)
 
-TypeInvariant == 
+TypeInvariant ==
     \* /\ txnHistory \in Seq(AnyOpType) seems expensive to check with TLC, so disable it.
     /\ dataStore    \in DataStoreType
     /\ txnSnapshots \in [txnIds -> (DataStoreType \cup {Empty})]
-    /\ runningTxns  \in SUBSET [ id : txnIds, 
-                                 startTime  : Nat, 
+    /\ txnProg      \in [txnIds -> (BodyType \cup {Empty})]
+    /\ runningTxns  \in SUBSET [ id : txnIds,
+                                 startTime  : Nat,
                                  commitTime : Nat \cup {Empty}]
 
-Init ==  
-    /\ runningTxns = {} 
+Init ==
+    /\ runningTxns = {}
     /\ txnHistory = <<>>
     /\ clock = 0
     /\ txnSnapshots = [id \in txnIds |-> Empty]
+    /\ txnProg = [id \in txnIds |-> Empty]
     /\ dataStore = [k \in keys |-> Empty]
 
 (**************************************************************************************************)
@@ -142,16 +178,14 @@ CommitOp(h, txnId) == CHOOSE op \in Range(h) : op.txnId = txnId /\ op.type = "co
 CommittedTxns(h) == {op.txnId : op \in {op \in Range(h) : op.type = "commit"}}
 AbortedTxns(h)   == {op.txnId : op \in {op \in Range(h) : op.type = "abort"}}
 
-\* The set of all read or write ops done by a given transaction.                   
-ReadsByTxn(h, txnId)  == {op \in Range(h) : op.txnId = txnId /\ op.type = "read"}
-WritesByTxn(h, txnId) == {op \in Range(h) : op.txnId = txnId /\ op.type = "write"}
+\* Whether a given transaction read or wrote a given key, read off its body event.
+ReadsKey(h, txnId, k)  == \E op \in Range(h) : op.txnId = txnId /\ op.type = "body" /\ k \in op.reads
+WritesKey(h, txnId, k) == \E op \in Range(h) : op.txnId = txnId /\ op.type = "body" /\
+                              \E w \in op.writes : w.key = k
 
-\* The set of all keys read or written to by a given transaction.                   
-KeysReadByTxn(h, txnId)    == { op.key : op \in ReadsByTxn(txnHistory, txnId)}
-KeysWrittenByTxn(h, txnId) == { op.key : op \in WritesByTxn(txnHistory, txnId)}
-
-\* The index of a given operation in the transaction history sequence.
-IndexOfOp(h, op) == CHOOSE i \in DOMAIN h : h[i] = op
+\* The set of all keys read or written to by a given transaction.
+KeysReadByTxn(h, txnId)    == {k \in keys : ReadsKey(h, txnId, k)}
+KeysWrittenByTxn(h, txnId) == {k \in keys : WritesKey(h, txnId, k)}
 
 RunningTxnIds == {txn.id : txn \in runningTxns}
 
@@ -168,29 +202,47 @@ RunningTxnIds == {txn.id : txn \in runningTxns}
 (* perform its reads and writes against.  In a real system, this data would not be literally      *)
 (* "copied", but this is the fundamental concept of snapshot isolation i.e.  that each            *)
 (* transaction appears to operate on its own local snapshot of the database.                      *)
+(*                                                                                                *)
+(* The transaction's whole body runs in this same step, and is recorded as a single 'body' event. *)
+(* Its reads are served from the snapshot and its writes are applied to the snapshot, not to the  *)
+(* data store; the data store is only updated at commit time.                                     *)
 (**************************************************************************************************)
-StartTxn(newTxnId) == 
-    LET newTxn == 
-        [ id |-> newTxnId, 
-            startTime |-> clock+1, 
+
+\* Fold a body's writes into a snapshot, giving the transaction's final snapshot. Each key is
+\* written at most once by a body, so there is no last-writer question.
+ApplyWrites(snap, W) ==
+    LET WK == {w.key : w \in W}
+    IN [k \in DOMAIN snap |-> IF k \in WK THEN (CHOOSE w \in W : w.key = k).val ELSE snap[k]]
+
+StartAndRun(newTxnId, body) ==
+    LET newTxn ==
+        [ id |-> newTxnId,
+            startTime |-> clock+1,
             commitTime |-> Empty] IN
     \* Must choose an unused transaction id. There must be no other operation
     \* in the history that already uses this id.
     /\ ~\E op \in Range(txnHistory) : op.txnId = newTxnId
-    \* Save a snapshot of current data store for this transaction, and
-    \* and append its 'begin' event to the history.
-    /\ txnSnapshots' = [txnSnapshots EXCEPT ![newTxnId] = dataStore]
-    /\ LET beginOp == [ type  |-> "begin", 
-                        txnId |-> newTxnId, 
-                        time  |-> clock+1 ] IN
-        txnHistory' = Append(txnHistory, beginOp)
+    \* Exclude uninteresting histories: a transaction must do at least one operation.
+    /\ (body.reads \cup WriteKeysOf(body)) /= {}
+    \* Save a snapshot of current data store for this transaction, with its own writes
+    \* applied, and append its 'begin' and 'body' events to the history.
+    /\ txnSnapshots' = [txnSnapshots EXCEPT ![newTxnId] = ApplyWrites(dataStore, body.writes)]
+    /\ txnProg' = [txnProg EXCEPT ![newTxnId] = body]
+    /\ LET beginOp == [ type  |-> "begin",
+                        txnId |-> newTxnId,
+                        time  |-> clock+1 ]
+           bodyOp  == [ type   |-> "body",
+                        txnId  |-> newTxnId,
+                        reads  |-> body.reads,
+                        writes |-> body.writes ] IN
+        txnHistory' = txnHistory \o <<beginOp, bodyOp>>
     \* Add transaction to the set of active transactions.
     /\ runningTxns' = runningTxns \cup {newTxn}
     \* Tick the clock.
-    /\ clock' = clock + 1    
+    /\ clock' = clock + 1
     /\ UNCHANGED <<dataStore>>
-                          
-                        
+
+
 (**************************************************************************************************)
 (* When a transaction T0 is ready to commit, it obeys the "First Committer Wins" rule.  T0 will   *)
 (* only successfully commit if no concurrent transaction has already committed writes of data     *)
@@ -203,37 +255,35 @@ StartTxn(newTxnId) ==
 \* Checks whether a given transaction is allowed to commit, based on whether it conflicts
 \* with other concurrent transactions that have already committed.
 TxnCanCommit(txnId) ==
-    \E txn \in runningTxns : 
+    \E txn \in runningTxns :
         /\ txn.id = txnId
         /\ ~\E op \in Range(txnHistory) :
-            /\ op.type = "commit" 
-            \* Did another transaction start after me.
-            /\ txn.id = txnId /\ op.time > txn.startTime 
+            /\ op.type = "commit"
+            \* Did another transaction commit after I started.
+            /\ op.time > txn.startTime
             /\ KeysWrittenByTxn(txnHistory, txnId) \cap op.updatedKeys /= {} \* Must be no conflicting keys.
-         
-CommitTxn(txnId) == 
+
+CommitTxn(txnId) ==
     \* Transaction must be able to commit i.e. have no write conflicts with concurrent.
     \* committed transactions.
     /\ txnId \in RunningTxnIds
-    \* Must not be a no-op transaction.
-    /\ (WritesByTxn(txnHistory, txnId) \cup ReadsByTxn(txnHistory, txnId)) /= {}
-    /\ TxnCanCommit(txnId)  
-    /\ LET commitOp == [ type          |-> "commit", 
-                         txnId         |-> txnId, 
+    /\ TxnCanCommit(txnId)
+    /\ LET commitOp == [ type          |-> "commit",
+                         txnId         |-> txnId,
                          time          |-> clock + 1,
                          updatedKeys   |-> KeysWrittenByTxn(txnHistory, txnId)] IN
-       txnHistory' = Append(txnHistory, commitOp)            
-    \* Merge this transaction's updates into the data store. If the 
+       txnHistory' = Append(txnHistory, commitOp)
+    \* Merge this transaction's updates into the data store. If the
     \* transaction has updated a key, then we use its version as the new
     \* value for that key. Otherwise the key remains unchanged.
-    /\ dataStore' = [k \in keys |-> IF k \in KeysWrittenByTxn(txnHistory, txnId) 
+    /\ dataStore' = [k \in keys |-> IF k \in KeysWrittenByTxn(txnHistory, txnId)
                                         THEN txnSnapshots[txnId][k]
                                         ELSE dataStore[k]]
-    \* Remove the transaction from the active set. 
+    \* Remove the transaction from the active set.
     /\ runningTxns' = {r \in runningTxns : r.id # txnId}
     /\ clock' = clock + 1
-    \* We can leave the snapshot around, since it won't be used again.
-    /\ UNCHANGED <<txnSnapshots>>
+    \* We can leave the snapshot and the body around, since they won't be used again.
+    /\ UNCHANGED <<txnSnapshots, txnProg>>
 
 (**************************************************************************************************)
 (* In this spec, a transaction aborts if and only if it cannot commit, due to write conflicts.    *)
@@ -242,50 +292,15 @@ AbortTxn(txnId) ==
     \* If a transaction can't commit due to write conflicts, then it
     \* must abort.
     /\ txnId \in RunningTxnIds
-    \* Must not be a no-op transaction.
-    /\ (WritesByTxn(txnHistory, txnId) \cup ReadsByTxn(txnHistory, txnId)) /= {}
     /\ ~TxnCanCommit(txnId)
-    /\ LET abortOp == [ type   |-> "abort", 
-                        txnId  |-> txnId, 
-                        time   |-> clock + 1] IN    
+    /\ LET abortOp == [ type   |-> "abort",
+                        txnId  |-> txnId,
+                        time   |-> clock + 1] IN
        txnHistory' = Append(txnHistory, abortOp)
     /\ runningTxns' = {r \in runningTxns : r.id # txnId} \* transaction is no longer running.
     /\ clock' = clock + 1
     \* No changes are made to the data store.
-    /\ UNCHANGED <<dataStore, txnSnapshots>>
-
-(***************************************************************************************************)
-(* Read and write operations executed by transactions.                                            *)
-(*                                                                                                *)
-(* As a simplification, and to limit the size of potential models, we allow transactions to only  *)
-(* read or write to the same key once.  The idea is that it limits the state space without loss   *)
-(* of generality.                                                                                 *)
-(**************************************************************************************************)
-
-TxnRead(txnId, k) == 
-    \* Read from this transaction's snapshot.
-    /\ txnId \in RunningTxnIds
-    /\ LET valRead == txnSnapshots[txnId][k]
-        readOp == [ type  |-> "read", 
-                    txnId |-> txnId, 
-                    key   |-> k, 
-                    val   |-> valRead] IN
-        /\ k \notin KeysReadByTxn(txnHistory, txnId)   
-        /\ txnHistory' = Append(txnHistory, readOp)
-        /\ UNCHANGED <<dataStore, clock, runningTxns, txnSnapshots>>
-                   
-TxnUpdate(txnId, k, v) == 
-    /\ txnId \in RunningTxnIds
-    /\ LET writeOp == [ type  |-> "write", 
-                        txnId |-> txnId, 
-                        key   |-> k, 
-                        val   |-> v] IN  
-        /\ k \notin KeysWrittenByTxn(txnHistory, txnId)
-        \* We update the transaction's snapshot, not the actual data store.
-        /\ LET updatedSnapshot == [txnSnapshots[txnId] EXCEPT ![k] = v] IN
-            txnSnapshots' = [txnSnapshots EXCEPT ![txnId] = updatedSnapshot]
-        /\ txnHistory' = Append(txnHistory, writeOp)
-        /\ UNCHANGED <<dataStore, runningTxns, clock>>
+    /\ UNCHANGED <<dataStore, txnSnapshots, txnProg>>
 
 (**************************************************************************************************)
 (* The next-state relation and spec definition.                                                   *)
@@ -294,25 +309,17 @@ TxnUpdate(txnId, k, v) ==
 (* in the algorithm, we want to explicitly define what a "valid" termination state is.  If all    *)
 (* transactions have run and either committed or aborted, we consider that valid termination, and *)
 (* is allowed as an infinite suttering step.                                                      *)
-(*                                                                                                *)
-(* Also, once a transaction knows that it cannot commit due to write conflicts, we don't let it   *)
-(* do any more reads or writes, so as to eliminate wasted operations.  That is, once we know a    *)
-(* transaction can't commit, we force its next action to be abort.                                *)
-(**************************************************************************************************)           
+(**************************************************************************************************)
 
 AllTxnsFinished == AbortedTxns(txnHistory) \cup CommittedTxns(txnHistory) = txnIds
-    
-Next == 
-    \/ \E tid \in txnIds : StartTxn(tid)
-    \* Ends a given transaction by either committing or aborting it. To exclude uninteresting 
-    \* histories, we require that a transaction does at least one operation before committing or aborting. 
+
+Next ==
+    \* Starts a transaction and runs its entire body, which is chosen nondeterministically.
+    \/ \E tid \in txnIds, body \in Bodies : StartAndRun(tid, body)
+    \* Ends a given transaction by either committing or aborting it.
     \* Assumes that the given transaction is currently running.
     \/ \E tid \in txnIds : CommitTxn(tid)
     \/ \E tid \in txnIds : AbortTxn(tid)
-    \* Transaction reads or writes a key. We limit transactions
-    \* to only read or write the same key once.
-    \/ \E tid \in txnIds, k \in keys : TxnRead(tid, k)
-    \/ \E tid \in txnIds, k \in keys, v \in values : TxnUpdate(tid, k, v)
     \/ (AllTxnsFinished /\ UNCHANGED vars)
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
@@ -330,44 +337,12 @@ Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 
 
 (**************************************************************************************************)
-(* Operator for computing cycles in a given graph, defined by a set of edges.                     *)
-(*                                                                                                *)
-(* Returns a set containing all elements that participate in any cycle (i.e.  union of all        *)
-(* cycles), or an empty set if no cycle is found.                                                 *)
-(*                                                                                                *)
-(* Source:                                                                                        *)
-(* https://github.com/pron/amazon-snapshot-spec/blob/master/serializableSnapshotIsolation.tla.    *)
-(**************************************************************************************************)
-\* FindAllNodesInAnyCycle(edges) ==
-
-\*     LET RECURSIVE findCycleNodes(_, _)   (* startNode, visitedSet *)
-\*         (* Returns a set containing all elements of some cycle starting at startNode,
-\*            or an empty set if no cycle is found. 
-\*          *)
-\*         findCycleNodes(node, visitedSet) ==
-\*             IF node \in visitedSet THEN
-\*                 {node}  (* found a cycle, which includes node *)
-\*             ELSE
-\*                 LET newVisited == visitedSet \union {node}
-\*                     neighbors == {to : <<from, to>> \in 
-\*                                            {<<from, to>> \in edges : from = node}}
-\*                 IN  (* Explore neighbors *)
-\*                     UNION {findCycleNodes(neighbor, newVisited) : neighbor \in neighbors}
-                    
-\*         startPoints == {from : <<from, to>> \in edges}  (* All nodes with an outgoing edge *)
-\*     IN 
-\*         UNION {findCycleNodes(node, {}) : node \in startPoints}
-       
-\* IsCycle(edges) == FindAllNodesInAnyCycle(edges) /= {}
-
-
-(**************************************************************************************************)
 (* An alternative cycle check expressed directly in terms of paths, following the style of the    *)
 (* CommunityModules Graphs module (Path / HasCycle):                                              *)
 (*                                                                                                *)
 (* https://github.com/tlaplus/CommunityModules/blob/master/modules/Graphs.tla                     *)
 (*                                                                                                *)
-(* This avoids the recursive operator above.  A path is a non-empty sequence of nodes in which    *)
+(* This avoids a recursive operator.  A path is a non-empty sequence of nodes in which            *)
 (* consecutive nodes are joined by an edge; a cycle is a path that returns to its starting node.  *)
 (*                                                                                                *)
 (* Graphs.Path uses Seq(G.node) directly, but TLC cannot enumerate Seq of a non-empty set (it is  *)
@@ -432,32 +407,26 @@ IsCycleViaPath(edges) ==
 
 \* T1 wrote to a key that T2 then also wrote to. The First Committer Wins rule implies
 \* that T1 must have committed before T2 began.
-WWDependency(h, t1Id, t2Id) == 
-    \E op1 \in WritesByTxn(h, t1Id) :
-    \E op2 \in WritesByTxn(h, t2Id) :
-        /\ op1.key = op2.key
-        /\ CommitOp(h, t1Id).time < CommitOp(h, t2Id).time
+WWDependency(h, t1Id, t2Id) ==
+    /\ \E k \in keys : WritesKey(h, t1Id, k) /\ WritesKey(h, t2Id, k)
+    /\ CommitOp(h, t1Id).time < CommitOp(h, t2Id).time
 
 \* T1 wrote to a key that T2 then later read, after T1 committed.
-WRDependency(h, t1Id, t2Id) == 
-    \E op1 \in WritesByTxn(h, t1Id) :
-    \E op2 \in ReadsByTxn(h, t2Id) :
-        /\ op1.key = op2.key
-        /\ CommitOp(h, t1Id).time < BeginOp(h, t2Id).time   
+WRDependency(h, t1Id, t2Id) ==
+    /\ \E k \in keys : WritesKey(h, t1Id, k) /\ ReadsKey(h, t2Id, k)
+    /\ CommitOp(h, t1Id).time < BeginOp(h, t2Id).time
 
-\* T1 read a key that T2 then later wrote to. T1 must start before T2 commits, since this implies that T1 read  
-\* a version of the key and T2 produced a later version of that ke, i.e. when it commits. T1, however, read 
+\* T1 read a key that T2 then later wrote to. T1 must start before T2 commits, since this implies that T1 read
+\* a version of the key and T2 produced a later version of that key, i.e. when it commits. T1, however, read
 \* an earlier version of that key, because it started before T2 committed.
-RWDependency(h, t1Id, t2Id) == 
-    \E op1 \in ReadsByTxn(h, t1Id) :
-    \E op2 \in WritesByTxn(h, t2Id) :
-        /\ op1.key = op2.key
-        /\ BeginOp(h, t1Id).time < CommitOp(h, t2Id).time  \* T1 starts before T2 commits. This means that T1 read
-        
+RWDependency(h, t1Id, t2Id) ==
+    /\ \E k \in keys : ReadsKey(h, t1Id, k) /\ WritesKey(h, t2Id, k)
+    /\ BeginOp(h, t1Id).time < CommitOp(h, t2Id).time
 
-\* Produces the serialization graph as defined above, for a given history. This graph is produced 
+
+\* Produces the serialization graph as defined above, for a given history. This graph is produced
 \* by defining the appropriate set comprehension, where the produced set contains all the edges of the graph.
-SerializationGraph(history) == 
+SerializationGraph(history) ==
     LET committedTxnIds == CommittedTxns(history) IN
     {tedge \in (committedTxnIds \X committedTxnIds):
         /\ tedge[1] /= tedge[2]
@@ -465,11 +434,11 @@ SerializationGraph(history) ==
            \/ WRDependency(history, tedge[1], tedge[2])
            \/ RWDependency(history, tedge[1], tedge[2])}
 
-\* The key property to verify i.e. serializability of transaction histories.
-\* IsConflictSerializable(h) == ~IsCycle(SerializationGraph(h))
-
-\* Equivalent property using the path-based cycle check instead of the recursive one.
+\* The key property to verify i.e. serializability of transaction histories, expressed using the
+\* path-based cycle check.
 IsConflictSerializableViaPath(h) == ~IsCycleViaPath(SerializationGraph(h))
+
+SerializableViaPath == IsConflictSerializableViaPath(txnHistory)
 
 
 -------------------------------------------------
