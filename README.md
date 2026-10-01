@@ -223,6 +223,114 @@ Two notes on how the invariant is set up, both of which keep the proof tractable
   every step; quantifying over operations instead and converting once, at the end, keeps that
   reasoning in one place.
 
+## A machine-checked proof for TPC-C: `TPCC_Proofs.tla`
+
+`TPCC_Proofs.tla` is a complete TLAPS proof of
+
+```
+THEOREM Safety == Spec => []SerializableViaPath
+```
+
+for `TPCC.tla`, under two explicit assumptions:
+
+```
+ASSUME ColGran   == ColumnGranularity = TRUE
+ASSUME RobustMix == EnabledTxnTypes \subseteq {"NewOrder","Payment","OrderStatus","StockLevel"}
+```
+
+Unbounded in every scale factor — any number of warehouses, districts, customers, items,
+orders and transactions — unlike the TLC runs above, which fix 1 warehouse and 3 transactions.
+
+```bash
+tlapm TPCC_Proofs.tla      # 1275 obligations, no OMITTED steps
+```
+
+(The TLC side of this comparison is `configs/row-3txn.cfg` and `configs/col-delivery.cfg`,
+both of which check `SerializableViaPath`. The older TPC-C configs — `col-3txn`, `col-allmix`
+and the `cov-*` set — still name `Serializable`, `NoReadAfterWrite`, `NoDuplicateOps`,
+`OrderIdsContiguous` and `NoDangerousStructure`, which the current `TPCC.tla` no longer
+defines; TLC rejects them at parse time until they are updated.)
+
+### The argument
+
+Same rank-function shape as the auction proof: the MVSG carries a strictly increasing integer
+rank, so it is acyclic.
+
+```
+rank(t) == IF t writes anything THEN commit(t) ELSE begin(t)
+```
+
+Four properties of the history make every edge increase it:
+
+| | property | source |
+|---|---|---|
+| H1 | `begin(t) < commit(t)` | the clock ticks on both events |
+| H2 | a committed transaction never writes a read-only column group | **the workload** |
+| H3 | an updater reads a *writable* key only if it also writes it | **the workload** |
+| H4 | two committed transactions writing a common key have disjoint lifetimes | First-Committer-Wins |
+
+H3 is the clause write skew would ride on, and it needs relativising for TPC-C in a way the
+auction did not. New-Order reads `W_TAX`, `D_TAX`, `CUSTOMER.info` and `ITEM.info` without
+writing them, so the plain "updaters read only what they write" is false here. Those four
+column groups are read-only for the entire benchmark (`ReadOnlyKey` in the proof), and a read
+of a key nobody writes emits no rw-edge, so excluding them costs nothing. H2 is what makes
+that exclusion sound: it says no committed transaction ever writes one of those groups, so
+`ReadOnlyKey` really is read-only rather than merely read-only-so-far.
+
+With H3 in hand the rw case splits exactly as in the auction proof — a read-only `t1` gives
+`begin(t1) < commit(t2)` directly from the edge, and an updating `t1` must also have written
+the key, so H4 upgrades the anti-dependency to a commit-order edge. Only read-only
+transactions emit genuine anti-dependency edges, and they have no outgoing ww or wr edges.
+
+### Why each assumption is needed
+
+The two assumptions have different status, and it is worth being precise about which.
+
+**`ColGran` is necessary.** Under row granularity `W_TAX` and `W_YTD` collapse into one
+WAREHOUSE key that New-Order reads and Payment writes. `ReadOnlyKey` has nothing left to
+exempt, and H3 fails for New-Order. This is not an artifact of the argument:
+`configs/row-3txn.cfg` is a genuine counterexample to `SerializableViaPath` itself, so no proof
+of the unrestricted statement exists.
+
+**`RobustMix` is a limit of this argument, with the question left open.** Delivery breaks H3: it
+reads `ORDER.hdr` and `ORDERLINE.items` — both written by New-Order, so neither is a
+`ReadOnlyKey` — without writing either. Its writes go to `NEWORDER.row`, `ORDER.carrier`,
+`ORDERLINE.delivery` and `CUSTOMER.balance`, a disjoint set. So Delivery is an updater emitting
+real anti-dependency edges, which is exactly the shape the rank function cannot absorb.
+
+Unlike the row-granularity case, that does *not* come with a counterexample. TLC on
+`configs/col-delivery.cfg` (New-Order + Delivery, 3 txns) finds **no error** in 162,565 distinct
+states. So whether TPC-C including Delivery is serializable under column-granularity SI is
+open as far as this development goes — the rank function is simply the wrong proof technique
+for it, and a proof would need the cycle-based dangerous-structure argument the rank function
+was chosen to avoid.
+
+The other three profiles go through directly: Payment reads `W_YTD`, `D_YTD` and `C_BALANCE`
+and writes all three; Order-Status and Stock-Level write nothing, making H2 and H3 vacuous.
+
+### Structure
+
+| Part | Content |
+|---|---|
+| 1 | base case: the empty history is serializable |
+| 2 | generic: a graph with a strictly increasing rank has no cycle |
+| 3 | H1–H4 make every MVSG edge increase the rank |
+| 4 | the workload lemma: the four enabled profiles satisfy H2 and H3 |
+| 5–6 | sequence infrastructure, and the inductive invariant |
+| 7 | converting the invariant to H1–H4 |
+| 8–11 | initial state and the four actions |
+| 12 | assembly |
+
+As in the auction proof, the invariant carries `\E S : txnHistory \in Seq(S)` rather than a
+precise operation type, and states its clauses over the *range* of the history rather than
+through `BeginOp` / `CommitOp`. Those two are `CHOOSE`s; quantifying over operations instead
+and converting once, in Part 7, keeps the uniqueness reasoning in one place.
+
+One thing made this tractable that the earlier TPC-C attempt lacked: because `TPCC.tla` records
+a transaction body as a *single* event carrying its read and write key sets, the workload lemma
+is pure set reasoning over `RdKeys` / `WrOps`, with no recursive sequence-concatenation
+operator to unfold.
+
 ## Limits
 
 - Bounded instances only. 3 transactions, 1 warehouse, 2 districts. The 1.31M-state run is

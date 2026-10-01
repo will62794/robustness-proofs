@@ -33,7 +33,7 @@
 (* order to deliver, `ORDER.hdr` picks a customer, `ORDERLINE.items` picks stock rows to scan).   *)
 (*                                                                                                *)
 (**************************************************************************************************)
-EXTENDS Naturals, FiniteSets, Sequences
+EXTENDS Naturals, FiniteSets, Sequences, Functions
 
 (**************************************************************************************************)
 (* Scale factors.  Everything about the modelled database is derived from these.                  *)
@@ -212,7 +212,7 @@ WriteKeysOf(B) == {w.key : w \in B.writes}
 Min(S) == CHOOSE x \in S : \A y \in S : x =< y
 Max(S) == CHOOSE x \in S : \A y \in S : y =< x
 
-Range(f) == {f[x] : x \in DOMAIN f}
+\* Range(f) == {f[x] : x \in DOMAIN f}
 
 CommittedTxns(h) == {op.txnId : op \in {op \in Range(h) : op.type = "commit"}}
 AbortedTxns(h)   == {op.txnId : op \in {op \in Range(h) : op.type = "abort"}}
