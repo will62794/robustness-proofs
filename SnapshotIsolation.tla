@@ -357,9 +357,11 @@ GraphNodes(edges) == {e[1] : e \in edges} \cup {e[2] : e \in edges}
 \* The set of all paths of a given graph, i.e. all non-empty sequences of nodes whose consecutive
 \* elements are connected by an edge. Path length is bounded by the number of nodes, which keeps
 \* the set finite without losing the ability to detect a cycle.
+PathBound(edges) == Cardinality(GraphNodes(edges)) + 1
+
 Paths(edges) ==
     LET nodes == GraphNodes(edges)
-        maxLen == Cardinality(nodes) + 1
+        maxLen == PathBound(edges)
     IN  {p \in UNION {[1..n -> nodes] : n \in 1..maxLen} :
             \A i \in 1..(Len(p)-1) : <<p[i], p[i+1]>> \in edges}
 

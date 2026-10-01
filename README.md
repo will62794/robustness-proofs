@@ -331,6 +331,50 @@ a transaction body as a *single* event carrying its read and write key sets, the
 is pure set reasoning over `RdKeys` / `WrOps`, with no recursive sequence-concatenation
 operator to unfold.
 
+## SmallBank: `SmallBank.tla`
+
+The SmallBank benchmark (Alomari, Cahill, Fekete & Röhm, ICDE 2008), with the same structure as
+`TPCC.tla` and `Auction.tla`: it `INSTANCE`s `SnapshotIsolation` and supplies only the five
+programs — Balance, DepositChecking, TransactSavings, Amalgamate, WriteCheck — as read/write
+key sets over `ACCOUNT`, `SAVINGS` and `CHECKING`.
+
+No stored value steers which keys a SmallBank program touches (every access is by primary key),
+so balances are abstracted to a constant tag, as TPCC does for its non-steering columns. As a
+result, balance-dependent client rollbacks aren't modelled.
+
+| Config | Mix | Result |
+|---|---|---|
+| `smallbank-robust` | all but WriteCheck, 2 customers, 3 txns | **serializable**: 116,401 distinct states, no error |
+| `smallbank-nobalance` | all but Balance, 2 customers, 3 txns | **serializable**: 116,401 distinct states, no error |
+| `smallbank-roanomaly` | Balance + WriteCheck + TransactSavings, 1 customer | **VIOLATED** in 3s |
+| `smallbank-allmix` | all five, 2 customers, 3 txns | **VIOLATED** in 24s |
+
+In both robust runs `Cov_RWEdgeExists`, `Cov_SomeTxnAborts` and `Cov_AllTxnsCommit` fail as
+expected, so neither result is vacuous.
+
+The counterexample is the Fekete/O'Neil/O'Neil read-only anomaly, with WriteCheck as the pivot:
+
+```
+T1  WriteCheck(c1)        begin@1  commit@5
+T2  TransactSavings(c1)   begin@2  commit@3
+T3  Balance(c1)           begin@4  commit@6
+
+T1 --rw--> T2    T1 read SAVINGS,   T2 wrote SAVINGS
+T2 --wr--> T3    T2 wrote SAVINGS,  T3 read SAVINGS
+T3 --rw--> T1    T3 read CHECKING,  T1 wrote CHECKING
+```
+
+WriteCheck is the only updater that reads a key it doesn't write (`SAVINGS`). So under the
+rank-function argument used in the proofs above, H2/H3 hold for every mix without WriteCheck.
+Leaving out Balance is also enough. WriteCheck's anti-dependency edges are then never preceded
+by another one, because every program that writes `CHECKING` also reads it.
+
+`mk.sh` hardcodes the `TPCC` module, so run these configs directly:
+
+```bash
+java -cp tla2tools.jar tlc2.TLC -workers 8 -config configs/smallbank-roanomaly.cfg SmallBank
+```
+
 ## Limits
 
 - Bounded instances only. 3 transactions, 1 warehouse, 2 districts. The 1.31M-state run is
