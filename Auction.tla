@@ -5,12 +5,19 @@
 (* Consistency Models with Atomic Visibility" (CONCUR 2016), running on top of a key-value store  *)
 (* that provides SNAPSHOT ISOLATION.                                                              *)
 (*                                                                                                *)
-(* The snapshot isolation layer is modelled directly here -- begin snapshot, read-your-own-       *)
-(* writes, the First-Committer-Wins write-conflict rule, and the multi-version serialization      *)
-(* graph (MVSG) used to decide conflict serializability -- in exactly the form `TPCC` uses.       *)
-(* This module adds a *workload*: it constrains which keys each transaction reads and writes, so  *)
-(* that the transactions are the four programs of the paper's running example rather than         *)
-(* arbitrary ones.                                                                                *)
+(* The snapshot isolation layer is not modelled here.  It is provided by instantiating the        *)
+(* `SnapshotIsolation` module, which owns the store state -- the committed data store, the         *)
+(* per-transaction snapshots, the clock, the set of running transactions, and the linear event     *)
+(* history -- together with the begin / commit / abort actions, read-your-own-writes, the          *)
+(* First-Committer-Wins rule, and the multi-version serialization graph (MVSG) used to decide      *)
+(* conflict serializability.  This module supplies only the *workload*: it constrains which keys   *)
+(* each transaction reads and writes, so that the transactions are the four programs of the        *)
+(* paper's running example rather than arbitrary ones.                                            *)
+(*                                                                                                *)
+(* The two layers are coupled through the transaction body.  `SnapshotIsolation.StartAndRun`       *)
+(* takes a body (a read key set and a write set) as a parameter; this module computes that body    *)
+(* from an auction request and the current committed store via `ProgramFor`, then hands it to the  *)
+(* instantiated action.                                                                           *)
 (*                                                                                                *)
 (* THE QUESTION                                                                                   *)
 (*                                                                                                *)
@@ -38,8 +45,8 @@
 (* transaction's writes are invisible until commit, and its reads see only its begin snapshot, so *)
 (* no other transaction observes the body's interleaving).  So the body is recorded as a single   *)
 (* event carrying those two sets, rather than as a sequence of individual read/write events.      *)
-(* This removes the need for a recursive sequence-concatenation operator (`Flatten`), which       *)
-(* TLAPS cannot unfold, and makes the workload analysis a matter of set reasoning.                *)
+(* This is the same representation `SnapshotIsolation` uses, which is exactly why a body computed *)
+(* here can be passed straight to its `StartAndRun` action.                                       *)
 (*                                                                                                *)
 (* The only thing carried beyond the key sets is the value of each write, because two stored      *)
 (* values steer control flow: USERS.name decides whether a RegUser may run at all, and            *)
@@ -107,7 +114,7 @@ ASSUME NumTxnsNat == NumTxns \in Nat
 (*   * USERS(uId).name -- read by RegUser's uniqueness check and by ViewUsers; its value is the   *)
 (*     only thing that decides whether RegUser inserts.  Stored exactly.                          *)
 (*   * ITEMS(iId).nbids -- read-modify-written by StoreBid and read by ViewItem.  Stored exactly, *)
-(*     because it is what makes the lost-update / write-conflict behaviour observable.            *)
+(*     because it is what makes the lost-update / write-conflict behaviour observable.             *)
 (*   * ITEMS(iId).desc -- never read or written by any program; dropped.                          *)
 (*   * BIDS(bId, iId, val) -- StoreBid's insert-only output.  No program reads BIDS, and each     *)
 (*     StoreBid uses a fresh bId, so it can never conflict.  Modelled with one fresh key per      *)
@@ -129,10 +136,20 @@ Keys == RowKeys
 \* for ITEMS it is the bid count; a BIDS row is just a marker.
 RowExists(snap, k) == snap[k] # Empty
 
+\* The value universe handed to `SnapshotIsolation`: the union of the per-table value sets below,
+\* plus the row-absence marker.  (Only SANY needs it; the `Bodies` set `SnapshotIsolation` builds
+\* from it is never used, since this module always supplies a body explicitly.)
+Vals == {Tag, Empty} \cup (0..MaxNbids) \cup NIds
+
 ----------------------------------------------------------------------------------------------------
 
 (**************************************************************************************************)
 (* Variables.                                                                                     *)
+(*                                                                                                *)
+(* The store variables -- clock, runningTxns, txnHistory, dataStore, txnSnapshots, txnProg -- are *)
+(* declared here and shared with the `SnapshotIsolation` instance below by the default same-name   *)
+(* substitution.  `txnReq` is this module's own bookkeeping: the auction request each transaction  *)
+(* is executing.                                                                                  *)
 (**************************************************************************************************)
 
 VARIABLE clock          \* ticks on every begin and commit
@@ -140,24 +157,38 @@ VARIABLE runningTxns    \* set of in-flight transactions
 VARIABLE txnHistory     \* the linear event history, the thing we check serializability of
 VARIABLE dataStore      \* the committed key-value store
 VARIABLE txnSnapshots   \* per-transaction snapshot of the store
-VARIABLE txnReq         \* txnId -> the auction request this transaction is executing
 VARIABLE txnProg        \* txnId -> the body this request expands to (reads / writes)
+VARIABLE txnReq         \* txnId -> the auction request this transaction is executing
 
 vars == <<clock, runningTxns, txnSnapshots, dataStore, txnHistory, txnReq, txnProg>>
+
+(**************************************************************************************************)
+(*                                                                                                *)
+(* The backing store: an instantiation of the `SnapshotIsolation` module.                          *)
+(*                                                                                                *)
+(* This provides the begin / commit / abort actions, the First-Committer-Wins rule, and the        *)
+(* multi-version serialization graph used to decide conflict serializability.  Its constants are   *)
+(* bound to this module's auction schema; its variables are the store variables declared above.    *)
+(*                                                                                                *)
+(**************************************************************************************************)
+
+SI == INSTANCE SnapshotIsolation WITH
+        txnIds <- TxnIds,
+        keys   <- Keys,
+        values <- Vals,
+        Empty  <- Empty
 
 (**************************************************************************************************)
 (*                                                                                                *)
 (* The operations a transaction body consists of.                                                 *)
 (*                                                                                                *)
 (* A body is a record with two fields: `reads`, the set of keys read, and `writes`, the set of    *)
-(* write operations (each a key together with the value written).  The MVSG itself uses only the  *)
-(* keys; the values are kept because they steer control flow.                                     *)
+(* write operations (each a key together with the value written).  This is exactly the shape       *)
+(* `SnapshotIsolation` expects (its `BodyType`); the MVSG itself uses only the keys, the values    *)
+(* are kept because they steer control flow.                                                      *)
 (*                                                                                                *)
 (**************************************************************************************************)
 
-\* The values a write may carry: a nickname (RegUser), a bid count (StoreBid's update of
-\* ITEMS.nbids), or the opaque row marker (StoreBid's BIDS insert).  Stated as a predicate rather
-\* than a set, because TLC will not build a set that mixes strings with integers.
 \* The value a write may carry is determined by the table it writes: a bid count for ITEMS, a
 \* nickname for USERS, the opaque row marker for BIDS.  Typing it per table (rather than by one
 \* union `{Tag, Empty} \cup Nat`) keeps every comparison within a single type, which is what TLC
@@ -175,15 +206,6 @@ IsBody(B) ==
     /\ DOMAIN B = {"reads", "writes"}
     /\ B.reads \subseteq Keys
     /\ \A w \in B.writes : IsWriteOp(w)
-
-WriteKeysOf(B) == {w.key : w \in B.writes}
-
-(**************************************************************************************************)
-(* Generic helpers.                                                                               *)
-(**************************************************************************************************)
-
-CommittedTxns(h) == {op.txnId : op \in {op \in Range(h) : op.type = "commit"}}
-AbortedTxns(h)   == {op.txnId : op \in {op \in Range(h) : op.type = "abort"}}
 
 ----------------------------------------------------------------------------------------------------
 
@@ -299,6 +321,8 @@ ProgramFor(tid, req, snap) ==
 (* Initial state                                                                                  *)
 (*                                                                                                *)
 (* A freshly loaded auction database: ITEMS exist with nbids = 0; USERS and BIDS are empty.       *)
+(* The store's initial value is workload-specific, so this module supplies it rather than         *)
+(* reusing `SnapshotIsolation`'s all-empty `Init`.                                                *)
 (*                                                                                                *)
 (**************************************************************************************************)
 
@@ -323,81 +347,30 @@ Init ==
 (*                                                                                                *)
 (* Actions                                                                                        *)
 (*                                                                                                *)
-(* `StartAndRun` begins a transaction and records its whole body as a single event.  Commit and   *)
-(* abort are separate steps.                                                                      *)
+(* These are thin wrappers over `SnapshotIsolation`.  `StartAndRun` picks an auction request,      *)
+(* turns it into a body via `ProgramFor`, and hands that body to `SI!StartAndRun`; commit and      *)
+(* abort delegate entirely.  The only state this module adds is `txnReq`, which each action must   *)
+(* pin.                                                                                           *)
 (*                                                                                                *)
 (**************************************************************************************************)
 
 Unused(tid) == ~\E op \in Range(txnHistory) : op.txnId = tid
 
-\* Fold a body's writes into a snapshot, giving the transaction's final snapshot.  Each key is
-\* written at most once by a body, so there is no last-writer question.
-ApplyWrites(snap, W) ==
-    LET WK == {w.key : w \in W}
-    IN [k \in DOMAIN snap \cup WK |->
-            IF k \in WK THEN (CHOOSE w \in W : w.key = k).val ELSE snap[k]]
-
 StartAndRun(tid, req) ==
-    /\ Unused(tid)
     /\ ReqEnabled(req, dataStore)
-    /\ LET prog    == ProgramFor(tid, req, dataStore)
-           beginOp == [type |-> "begin", txnId |-> tid, time |-> clock + 1]
-           bodyOp  == [type |-> "body",  txnId |-> tid, reads |-> prog.reads, writes |-> prog.writes]
-       IN /\ txnHistory'   = txnHistory \o <<beginOp, bodyOp>>
-          /\ txnSnapshots' = [txnSnapshots EXCEPT ![tid] = ApplyWrites(dataStore, prog.writes)]
-          /\ txnProg'      = [txnProg EXCEPT ![tid] = prog]
-    /\ runningTxns' = runningTxns \cup {[id |-> tid, startTime |-> clock + 1, commitTime |-> Empty]}
-    /\ clock' = clock + 1
+    /\ SI!StartAndRun(tid, ProgramFor(tid, req, dataStore))
     /\ txnReq' = [txnReq EXCEPT ![tid] = req]
-    /\ UNCHANGED <<dataStore>>
 
-\* The keys a transaction has written, read off its body event.
-KeysWrittenByTxn(t, h) ==
-    {k \in Keys : \E op \in Range(h) : op.txnId = t /\ op.type = "body" /\ \E w \in op.writes : w.key = k}
+CommitTxn(tid) ==
+    /\ SI!CommitTxn(tid)
+    /\ UNCHANGED txnReq
 
-(*----------------------------------------------------------------------------------------------*)
-(* First-Committer-Wins: a transaction may commit only if no transaction that started after it   *)
-(* began has already committed a write to a key it intends to write.                             *)
-(*----------------------------------------------------------------------------------------------*)
-TxnCanCommit(txnId) ==
-    \E txn \in runningTxns :
-        /\ txn.id = txnId
-        /\ ~\E op \in Range(txnHistory) :
-            /\ op.type = "commit"
-            /\ op.time > txn.startTime
-            /\ KeysWrittenByTxn(txnId, txnHistory) \cap op.updatedKeys /= {}
-
-CommitTxn(txnId) ==
-    /\ txnId \in {txn.id : txn \in runningTxns}
-    \* Must not be a no-op transaction.
-    /\ txnProg[txnId] /= Empty
-    /\ (txnProg[txnId].reads \cup WriteKeysOf(txnProg[txnId])) /= {}
-    /\ TxnCanCommit(txnId)
-    /\ LET commitOp == [type        |-> "commit",
-                        txnId       |-> txnId,
-                        time        |-> clock + 1,
-                        updatedKeys |-> KeysWrittenByTxn(txnId, txnHistory)] IN
-       txnHistory' = Append(txnHistory, commitOp)
-    /\ dataStore' = [k \in Keys |-> IF k \in KeysWrittenByTxn(txnId, txnHistory)
-                                        THEN txnSnapshots[txnId][k]
-                                        ELSE dataStore[k]]
-    /\ runningTxns' = {r \in runningTxns : r.id # txnId}
-    /\ clock' = clock + 1
-    /\ UNCHANGED <<txnSnapshots, txnReq, txnProg>>
-
-AbortTxn(txnId) ==
-    /\ txnId \in {txn.id : txn \in runningTxns}
-    /\ txnProg[txnId] /= Empty
-    /\ (txnProg[txnId].reads \cup WriteKeysOf(txnProg[txnId])) /= {}
-    /\ ~TxnCanCommit(txnId)
-    /\ LET abortOp == [type |-> "abort", txnId |-> txnId, time |-> clock + 1] IN
-       txnHistory' = Append(txnHistory, abortOp)
-    /\ runningTxns' = {r \in runningTxns : r.id # txnId}
-    /\ clock' = clock + 1
-    /\ UNCHANGED <<dataStore, txnSnapshots, txnReq, txnProg>>
+AbortTxn(tid) ==
+    /\ SI!AbortTxn(tid)
+    /\ UNCHANGED txnReq
 
 AllTxnsDone == \A tid \in TxnIds :
-    \/ tid \in CommittedTxns(txnHistory) \cup AbortedTxns(txnHistory)
+    \/ tid \in SI!CommittedTxns(txnHistory) \cup SI!AbortedTxns(txnHistory)
     \/ ~\E req \in Requests : Unused(tid) /\ ReqEnabled(req, dataStore)
 
 Next ==
@@ -412,58 +385,12 @@ Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 
 (**************************************************************************************************)
 (*                                                                                                *)
-(* The multi-version serialization graph                                                          *)
-(*                                                                                                *)
-(* An edge T1 -> T2 between committed transactions when:                                          *)
-(*   ww  T1 writes a key T2 also writes (so T1 committed first).                                  *)
-(*   wr  T1 writes a key T2 reads, and T1 committed before T2 began.                              *)
-(*   rw  T1 reads a key T2 writes, and T1 began before T2 committed.                              *)
+(* Conflict serializability.  This is entirely the `SnapshotIsolation` notion -- the multi-version *)
+(* serialization graph over the shared event history -- so it is taken from the instance.          *)
 (*                                                                                                *)
 (**************************************************************************************************)
 
-BeginOp(h, t)  == CHOOSE op \in Range(h) : op.txnId = t /\ op.type = "begin"
-CommitOp(h, t) == CHOOSE op \in Range(h) : op.txnId = t /\ op.type = "commit"
-
-ReadsKey(h, t, k)  == \E op \in Range(h) : op.txnId = t /\ op.type = "body" /\ k \in op.reads
-WritesKey(h, t, k) == \E op \in Range(h) : op.txnId = t /\ op.type = "body" /\
-                          \E w \in op.writes : w.key = k
-
-WWDependency(h, t1, t2) ==
-    (\E k \in Keys : WritesKey(h, t1, k) /\ WritesKey(h, t2, k))
-    /\ CommitOp(h, t1).time < CommitOp(h, t2).time
-
-WRDependency(h, t1, t2) ==
-    (\E k \in Keys : WritesKey(h, t1, k) /\ ReadsKey(h, t2, k))
-    /\ CommitOp(h, t1).time < BeginOp(h, t2).time
-
-RWDependency(h, t1, t2) ==
-    (\E k \in Keys : ReadsKey(h, t1, k) /\ WritesKey(h, t2, k))
-    /\ BeginOp(h, t1).time < CommitOp(h, t2).time
-
-SerializationGraph(h) ==
-    LET CT == CommittedTxns(h) IN
-    {e \in (CT \X CT) :
-        /\ e[1] /= e[2]
-        /\ \/ WWDependency(h, e[1], e[2])
-           \/ WRDependency(h, e[1], e[2])
-           \/ RWDependency(h, e[1], e[2])}
-
-GraphNodes(edges) == {e[1] : e \in edges} \cup {e[2] : e \in edges}
-
-\* The set of all paths of a given graph, i.e. all non-empty sequences of nodes whose consecutive
-\* elements are connected by an edge.  Path length is bounded by the number of nodes plus one,
-\* which keeps the set finite without losing the ability to detect a cycle.
-Paths(edges) ==
-    LET nodes == GraphNodes(edges)
-        maxLen == Cardinality(nodes) + 1
-    IN  {p \in UNION {[1..n -> nodes] : n \in 1..maxLen} :
-            \A i \in 1..(Len(p)-1) : <<p[i], p[i+1]>> \in edges}
-
-IsCycleViaPath(edges) == \E p \in Paths(edges) : Len(p) > 1 /\ p[1] = p[Len(p)]
-
-IsConflictSerializableViaPath(h) == ~IsCycleViaPath(SerializationGraph(h))
-
-SerializableViaPath == IsConflictSerializableViaPath(txnHistory)
+SerializableViaPath == SI!SerializableViaPath
 
 ----------------------------------------------------------------------------------------------------
 
@@ -483,19 +410,19 @@ TypeOK ==
 (* is not vacuously serializable because nothing interesting ever happens.  Each one failing      *)
 (* means TLC found a behaviour reaching that situation.                                           *)
 (**************************************************************************************************)
-CommittedCount == Cardinality(CommittedTxns(txnHistory))
+CommittedCount == Cardinality(SI!CommittedTxns(txnHistory))
 
 Cov_AllTxnsCommit  == CommittedCount < NumTxns
-Cov_SomeTxnAborts  == AbortedTxns(txnHistory) = {}
+Cov_SomeTxnAborts  == SI!AbortedTxns(txnHistory) = {}
 Cov_ConcurrentTxns == Cardinality(runningTxns) < 2
 
-Cov_TypeCommits(ty) == ~\E t \in CommittedTxns(txnHistory) :
+Cov_TypeCommits(ty) == ~\E t \in SI!CommittedTxns(txnHistory) :
                             txnReq[t] # Empty /\ txnReq[t].type = ty
 
 \* An rw-anti-dependency between two committed transactions is the ingredient every SI anomaly
 \* needs.  If this never fails, the model is too small to say anything about serializability.
 Cov_RWEdgeExists ==
-    ~\E t1, t2 \in CommittedTxns(txnHistory) :
-        t1 # t2 /\ RWDependency(txnHistory, t1, t2)
+    ~\E t1, t2 \in SI!CommittedTxns(txnHistory) :
+        t1 # t2 /\ SI!RWDependency(txnHistory, t1, t2)
 
 =====================================================================================================
