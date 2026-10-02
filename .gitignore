@@ -3,3 +3,5 @@ states/
 .tlacache/
 .DS_Store
 *.toolbox/
+.bin/
+output/

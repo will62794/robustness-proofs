@@ -1,0 +1,28 @@
+
+# Running the TLA+ Proof System (Tool)
+
+You can invoke the TLA+ proof system (TLAPS) to check correctness of a proof obligation in a TLA+ spec file <spec> with command
+
+```
+/usr/local/bin/tlapm --threads 8 --toolbox <proof_obl_line> <proof_obl_line> <spec>
+```
+
+You can run the tools a few time to understand the output format which returns status about the obligations proven or failed. you can also use the `--stretch` flag to control the time spent on checking the proof if needed to expand timeouts. In general, try not to push stretch to values higher than 3, trying to rely on decomposition instead when possible.
+
+Also, whenever you run the tlapm tool, try to record its output durably to a file somewhere, so that if you need to grep for failures/status info, you don't need to re-run the tool again. You can keep these log files in an `output` directory. In addition, BE CAREFUL to make sure you include the correct line numbers when checking a sub-obligation within a larger hierarchical proof. Don't leave out missing lines at the end. BE CAREFUL WITH THIS, so you don't accidentally mark a sub-goal of a proof as checked even though you left out some of it in your line ranges.
+
+IMPORTANT: Please do not use OMITTED to skip over proof obligations and leave them unproven.
+
+## Decomposing proofs
+
+If a proof obligation is unable to be proven automatically, you can try decomposing it into smaller steps and then trying to get the smaller steps to go through automatically. You can apply this process recursively until the proof obligations are small enough to be proven automatically.
+
+IMPORTANT RULE 1: When decomposing a goal into a set of sub-goals, always make sure that to verify that the QED step of all the sub-goals checks properly, to make sure that the decomposition is actually correct, before trying to dive in to make sure all of the sub-goals themselves are correct. Relatedly, try not to decompose more than one depth level at a time e.g. try to decompose one level, check to make sure all sub-goals imply the top-level goal, and then recursively decompose more if needed.
+
+IMPORTANT RULE 2: Try not to work on proving multiple sub-goals at the same time. Try to prove one sub-goal at a time, and then move on to the next one. For example, if a top-level goal has sub-goals <1>1, <1>2, <1>3, etc., try to prove <1>1 first, then <1>2, then <1>3, etc. Don't try to decompose multiple sub-goals at the same time.
+
+IMPORTANT RULE 3: Note that you cannot have proof steps at the same level with duplicate labels (e.g. two steps named <2>6a and <2>6a).
+
+## Subagent delegation
+
+Note that if it is helpful, you can start by laying out a high level proof skeleton/structure, and then over time delegate independent tasks to sub-agents to work on the proofs of these independent lemmas in parallel, if you deem they are independent enough in character and can be worked on independently.

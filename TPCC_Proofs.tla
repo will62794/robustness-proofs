@@ -1,2980 +1,1918 @@
------------------------------ MODULE TPCC_Proofs -----------------------------
-(*****************************************************************************)
-(* TLAPS proof that every history of the New-Order + Payment + Stock-Level   *)
-(* mix is conflict serializable under column-granularity SI:                 *)
-(*                                                                           *)
-(*     THEOREM Safety == Spec => []SerializableViaPath                       *)
-(*                                                                           *)
-(* The argument is a rank function on the multi-version serialization graph. *)
-(* Updaters are ranked by commit time, read-only transactions by begin time: *)
-(*                                                                           *)
-(*     rank(t) == IF t writes anything THEN commit(t) ELSE begin(t)          *)
-(*                                                                           *)
-(* Three history facts make every MVSG edge strictly increase this rank:     *)
-(*                                                                           *)
-(*   H1  begin(t) < commit(t)                                                *)
-(*   H2  an updater that reads a key someone writes also writes that key     *)
-(*   H3  two committed writers of a common key have disjoint lifetimes (FCW) *)
-(*                                                                           *)
-(* H2 is the workload fact.  Payment writes every key it reads.  Stock-Level *)
-(* writes nothing.  New-Order reads four columns it does not write -- W_TAX, *)
-(* D_TAX, C_DISCOUNT/C_LAST, I_PRICE -- and those columns are never written  *)
-(* by this mix, so they cannot appear on an rw-edge.  The keys New-Order     *)
-(* both reads and someone may write (D_NEXT_O_ID, S_QUANTITY) it also writes.*)
-(*                                                                           *)
-(* Column granularity is essential: at row granularity New-Order and Payment *)
-(* share the WAREHOUSE and DISTRICT rows, manufacturing false ww/rw edges    *)
-(* that close a cycle.                                                       *)
-(*****************************************************************************)
+---------------------------- MODULE TPCC_Proofs ----------------------------
+(***************************************************************************)
+(* A TLAPS proof that SerializableViaPath is an invariant of TPCC, under   *)
+(* column-granularity conflict detection.                                  *)
+(*                                                                         *)
+(* Proof idea.  Give every committed transaction t a position              *)
+(*                                                                         *)
+(*     Pos(t) = commit time of t   if t writes some key,                   *)
+(*            = begin time of t    if t is read-only,                      *)
+(*                                                                         *)
+(* and show that every edge t1 -> t2 of the serialization graph satisfies  *)
+(* Pos(t1) < Pos(t2).  Then no path can return to its start, so the graph  *)
+(* is acyclic.  WW and WR edges are easy.  For an RW edge whose source t1  *)
+(* is an updater, we need t1 to commit before t2.  If t1 also writes the   *)
+(* key, this is First-Committer-Wins.  Otherwise the key is one that an    *)
+(* updater reads but does not write, and the TPC-C workload guarantees     *)
+(* that such keys are never written concurrently:                          *)
+(*                                                                         *)
+(*   - New-Order's read-only keys (W_TAX, D_TAX, C_INFO, I_INFO) are       *)
+(*     never written by anybody.                                           *)
+(*   - Delivery's read-only keys (ORDER.hdr, ORDERLINE.items of an order   *)
+(*     o that is below the district's D_NEXT_O_ID) can only be written by  *)
+(*     a New-Order for order o, which either already committed, or is     *)
+(*     doomed (lost the D_NEXT_O_ID conflict), or can never start.         *)
+(*   - Payment reads only keys it also writes.                             *)
+(***************************************************************************)
+EXTENDS TPCC, TLAPS, SequenceTheorems, NaturalsInduction
 
-EXTENDS TPCC, NaturalsInduction, SequenceTheorems, FiniteSetTheorems, TLAPS
+ASSUME CGAssm == ColumnGranularity = TRUE
 
-ASSUME RobustMix == EnabledTxnTypes \subseteq {"NewOrder", "Payment", "StockLevel"}
-ASSUME ColumnMode == ColumnGranularity = TRUE
+\* Restates an assumption of TPCC (so that it can be cited by name).
+ASSUME InitOrdersAssm == InitOrders \in 0..MaxOrders
 
-ASSUME NumWarehousesNat == NumWarehouses \in Nat
-ASSUME NumDistrictsNat  == NumDistricts \in Nat
-ASSUME NumCustomersNat  == NumCustomers \in Nat
-ASSUME NumItemsNat      == NumItems \in Nat
-ASSUME MaxOrdersNat     == MaxOrders \in Nat
-ASSUME InitOrdersNat    == InitOrders \in Nat
-ASSUME StockLevelDepthNat == StockLevelDepth \in Nat
-ASSUME NumTxnsNat       == NumTxns \in Nat
+\* The initial DISTRICT row is not the "no row" value.
+ASSUME EmptyAssm == Empty # [tax |-> Tag, ytd |-> Tag, nextoid |-> InitOrders + 1]
 
------------------------------------------------------------------------------
-(*****************************************************************************)
-(* 1.  Empty history                                                         *)
-(*****************************************************************************)
+(***************************************************************************)
+(* Notation                                                                *)
+(***************************************************************************)
 
-LEMMA RangeEq == \A f : Range(f) = SI!Range(f)
-BY DEF Range, SI!Range
+NK(w, d)     == Item(DistKey(w, d), "nextoid")
+NOK(w, d, o) == Item(NewOrdKey(w, d, o), "row")
 
-LEMMA EmptyRange == Range(<<>>) = {}
-<1>1. <<>> \in Seq({})
-  BY EmptySeq
-<1>2. Range(<<>>) = {<<>>[i] : i \in 1..0}
-  BY <1>1, RangeEquality
-<1>. QED
-  BY <1>2
+UpdTypes == {"NewOrder", "Payment", "Delivery"}
 
-LEMMA EmptyCommitted == SI!CommittedTxns(<<>>) = {}
-<1>1. SI!Range(<<>>) = {}
-  BY EmptyRange, RangeEq
-<1>2. {op \in SI!Range(<<>>) : op.type = "commit"} = {}
-  BY <1>1
-<1>. QED
-  BY <1>1, <1>2 DEF SI!CommittedTxns
+Ops(h) == SI!Range(h)
 
-LEMMA EmptyGraph == SI!SerializationGraph(<<>>) = {}
-<1>1. SI!CommittedTxns(<<>>) = {}
-  BY EmptyCommitted
-<1>. QED
-  BY <1>1 DEF SI!SerializationGraph
+Started(h, t)   == \E op \in Ops(h) : op.txnId = t
+Committed(h, t) == \E op \in Ops(h) : op.txnId = t /\ op.type = "commit"
+Aborted(h, t)   == \E op \in Ops(h) : op.txnId = t /\ op.type = "abort"
 
-LEMMA EmptyGraphNodes == SI!GraphNodes({}) = {}
-BY DEF SI!GraphNodes
+BT(h, t) == SI!BeginOp(h, t).time
+CT(h, t) == SI!CommitOp(h, t).time
 
-LEMMA FunEmptyCodomain ==
-  ASSUME NEW S, S # {}
-  PROVE  [S -> {}] = {}
-<1> SUFFICES ASSUME NEW f \in [S -> {}]
-             PROVE  FALSE
-  OBVIOUS
-<1>1. PICK x \in S : TRUE
-  OBVIOUS
-<1>2. f[x] \in {}
-  OBVIOUS
-<1>. QED
-  BY <1>2
+RunIds(R) == {r.id : r \in R}
 
-LEMMA PathConsecutive ==
-  ASSUME NEW edges, NEW p \in SI!Paths(edges)
-  PROVE  \A i \in 1..(Len(p)-1) : <<p[i], p[i+1]>> \in edges
-BY DEF SI!Paths
+\* Keys written by a body, restricted to the key universe (as in the history).
+KWB(B)  == {k \in Keys : \E wop \in B.writes : wop.key = k}
+\* Keys read but not written by a body.
+RNWB(B) == (B.reads \cap Keys) \ KWB(B)
 
------------------------------------------------------------------------------
-(*****************************************************************************)
-(* 2.  Rank along a path implies acyclicity                                  *)
-(*****************************************************************************)
+KW(P, t) == KWB(P[t])
 
-LEMMA RankAlongSeq ==
-  ASSUME NEW n \in Nat,
-         NEW r(_),
-         NEW p,
-         n >= 1,
-         \A i \in 1..n : r(p[i]) \in Nat /\ r(p[i+1]) \in Nat /\ r(p[i]) < r(p[i+1])
-  PROVE  r(p[1]) + n <= r(p[n+1])
-<1> DEFINE P(m) ==
-             m \in Nat /\ m >= 1 /\
-             (\A i \in 1..m : r(p[i]) \in Nat /\ r(p[i+1]) \in Nat /\ r(p[i]) < r(p[i+1]))
-             => r(p[1]) + m <= r(p[m+1])
-<1>1. P(1)
-  OBVIOUS
-<1>2. \A m \in Nat : P(m) => P(m+1)
-  <2> SUFFICES ASSUME NEW m \in Nat, P(m)
-               PROVE  P(m+1)
+Doomed(h, P, t) ==
+    \E c \in Ops(h) : /\ c.type = "commit"
+                      /\ c.time > BT(h, t)
+                      /\ KW(P, t) \cap c.updatedKeys # {}
+
+WV(B, k) == (CHOOSE wop \in B.writes : wop.key = k).val
+
+(***************************************************************************)
+(* Facts about the TPC-C bodies.                                           *)
+(***************************************************************************)
+
+Static(req, B) ==
+    /\ req \in Requests
+    /\ req.type \notin UpdTypes => B.writes = {}
+    /\ req.type \in {"NewOrder", "Payment"} => \A k \in RNWB(B) : k.col \in {"tax", "info"}
+    /\ req.type = "Delivery" =>
+          \A k \in RNWB(B) : /\ k.tbl \in {"ORDER", "ORDERLINE"}
+                             /\ k.col \in {"hdr", "items"}
+                             /\ k.w \in WIds /\ k.d \in DIds /\ k.o \in OIds
+    /\ \A wop \in B.writes : wop.key.col \notin {"tax", "info"}
+    /\ req.type # "NewOrder" =>
+          \A wop \in B.writes :
+              /\ ~(wop.key.tbl = "DIST" /\ wop.key.col = "nextoid")
+              /\ ~(wop.key.tbl \in {"ORDER", "ORDERLINE"} /\ wop.key.col \in {"hdr", "items"})
+              /\ wop.key.tbl = "NEWORDER" => wop.val = Empty
+
+NOStatic(req, B, o) ==
+    /\ NK(req.w, req.d) \in KWB(B)
+    /\ \A wop \in B.writes :
+          (wop.key.tbl = "DIST" /\ wop.key.col = "nextoid") =>
+              wop.key = NK(req.w, req.d) /\ wop.val = o + 1
+    /\ \A wop \in B.writes :
+          wop.key.tbl \in {"ORDER", "ORDERLINE", "NEWORDER"} =>
+              wop.key.w = req.w /\ wop.key.d = req.d /\ wop.key.o = o
+
+DelDyn(req, B, store) ==
+    req.type = "Delivery" => \A k \in RNWB(B) : k.o < store[NK(k.w, k.d)]
+
+(***************************************************************************)
+(* The inductive invariant.                                                *)
+(***************************************************************************)
+
+TypeInv ==
+    /\ clock \in Nat
+    /\ txnHistory \in Seq(Ops(txnHistory))
+    /\ DOMAIN dataStore = Keys
+    /\ DOMAIN txnProg = TxnIds
+    /\ DOMAIN txnReq = TxnIds
+    /\ DOMAIN txnSnapshots = TxnIds
+
+HistInv ==
+    /\ \A op \in Ops(txnHistory) :
+          /\ op.txnId \in TxnIds
+          /\ op.type \in {"begin", "body", "commit", "abort"}
+          /\ op.type = "body" => /\ op.reads  = txnProg[op.txnId].reads
+                                 /\ op.writes = txnProg[op.txnId].writes
+          /\ op.type \in {"begin", "commit", "abort"} => op.time \in Nat /\ op.time =< clock
+          /\ op.type = "commit" => /\ op.updatedKeys = KW(txnProg, op.txnId)
+                                   /\ BT(txnHistory, op.txnId) < op.time
+    /\ \A op1, op2 \in Ops(txnHistory) :
+          op1.txnId = op2.txnId /\ op1.type = op2.type => op1 = op2
+    /\ \A t \in TxnIds : Started(txnHistory, t) =>
+          /\ \E op \in Ops(txnHistory) : op.txnId = t /\ op.type = "begin"
+          /\ \E op \in Ops(txnHistory) : op.txnId = t /\ op.type = "body"
+    /\ \A r \in runningTxns :
+          /\ r.id \in TxnIds
+          /\ Started(txnHistory, r.id)
+          /\ r.startTime = BT(txnHistory, r.id)
+          /\ ~Committed(txnHistory, r.id)
+          /\ ~Aborted(txnHistory, r.id)
+
+SnapInv ==
+    \A t \in TxnIds : Started(txnHistory, t) =>
+        \A k \in KW(txnProg, t) : txnSnapshots[t][k] = WV(txnProg[t], k)
+
+DataInvS(S) ==
+    /\ \A w \in WIds, d \in DIds : S[NK(w, d)] \in Nat
+    /\ \A w \in WIds, d \in DIds, o \in OIds :
+          S[NOK(w, d, o)] # Empty => o < S[NK(w, d)]
+
+DataInv == DataInvS(dataStore)
+
+BodyInv ==
+    \A t \in TxnIds : Started(txnHistory, t) =>
+        /\ Static(txnReq[t], txnProg[t])
+        /\ DelDyn(txnReq[t], txnProg[t], dataStore)
+        /\ txnReq[t].type = "NewOrder" =>
+              \E o \in OIds :
+                  /\ NOStatic(txnReq[t], txnProg[t], o)
+                  /\ (t \in RunIds(runningTxns) /\ ~Doomed(txnHistory, txnProg, t)) =>
+                        dataStore[NK(txnReq[t].w, txnReq[t].d)] = o
+
+SafeInv ==
+    /\ \A t1 \in RunIds(runningTxns) : txnReq[t1].type \in UpdTypes =>
+          \A k \in RNWB(txnProg[t1]) : \A y \in RunIds(runningTxns) :
+              (y # t1 /\ k \in KW(txnProg, y)) => Doomed(txnHistory, txnProg, y)
+    /\ \A t1 \in RunIds(runningTxns) : txnReq[t1].type \in UpdTypes =>
+          \A k \in RNWB(txnProg[t1]) : \A y \in TxnIds :
+              (Committed(txnHistory, y) /\ k \in KW(txnProg, y)) =>
+                  CT(txnHistory, y) < BT(txnHistory, t1)
+
+RWInv ==
+    \A t1, t2 \in TxnIds :
+        /\ Committed(txnHistory, t1) /\ Committed(txnHistory, t2) /\ t1 # t2
+        /\ KW(txnProg, t1) # {}
+        /\ \E k \in KW(txnProg, t2) : k \in txnProg[t1].reads
+        /\ BT(txnHistory, t1) < CT(txnHistory, t2)
+        => CT(txnHistory, t1) < CT(txnHistory, t2)
+
+Inv == TypeInv /\ HistInv /\ SnapInv /\ DataInv /\ BodyInv /\ SafeInv /\ RWInv
+
+----------------------------------------------------------------------------
+(***************************************************************************)
+(* Basic lemmas about keys.                                                *)
+(***************************************************************************)
+
+LEMMA ItemFields ==
+    ASSUME NEW b, NEW c
+    PROVE  /\ Item(b, c).col = c
+           /\ \A f \in DOMAIN b : f # "col" => Item(b, c)[f] = b[f]
+  BY CGAssm DEF Item
+
+LEMMA KeyFields ==
+    /\ \A w, d, c : /\ Item(DistKey(w, d), c).tbl = "DIST"
+                    /\ Item(DistKey(w, d), c).w = w
+                    /\ Item(DistKey(w, d), c).d = d
+                    /\ Item(DistKey(w, d), c).col = c
+    /\ \A w, c : /\ Item(WhKey(w), c).tbl = "WH"
+                 /\ Item(WhKey(w), c).col = c
+    /\ \A w, d, x, c : /\ Item(CustKey(w, d, x), c).tbl = "CUST"
+                       /\ Item(CustKey(w, d, x), c).col = c
+    /\ \A i, c : /\ Item(ItemKey(i), c).tbl = "ITEM"
+                 /\ Item(ItemKey(i), c).col = c
+    /\ \A w, i, c : /\ Item(StockKey(w, i), c).tbl = "STOCK"
+                    /\ Item(StockKey(w, i), c).col = c
+    /\ \A w, d, o, c : /\ Item(OrderKey(w, d, o), c).tbl = "ORDER"
+                       /\ Item(OrderKey(w, d, o), c).w = w
+                       /\ Item(OrderKey(w, d, o), c).d = d
+                       /\ Item(OrderKey(w, d, o), c).o = o
+                       /\ Item(OrderKey(w, d, o), c).col = c
+    /\ \A w, d, o, c : /\ Item(NewOrdKey(w, d, o), c).tbl = "NEWORDER"
+                       /\ Item(NewOrdKey(w, d, o), c).w = w
+                       /\ Item(NewOrdKey(w, d, o), c).d = d
+                       /\ Item(NewOrdKey(w, d, o), c).o = o
+                       /\ Item(NewOrdKey(w, d, o), c).col = c
+    /\ \A w, d, o, c : /\ Item(OrdLineKey(w, d, o), c).tbl = "ORDERLINE"
+                       /\ Item(OrdLineKey(w, d, o), c).w = w
+                       /\ Item(OrdLineKey(w, d, o), c).d = d
+                       /\ Item(OrdLineKey(w, d, o), c).o = o
+                       /\ Item(OrdLineKey(w, d, o), c).col = c
+    /\ \A x, c : /\ Item(HistKey(x), c).tbl = "HIST"
+                 /\ Item(HistKey(x), c).col = c
+  BY CGAssm DEF Item, DistKey, WhKey, CustKey, ItemKey, StockKey, OrderKey,
+                NewOrdKey, OrdLineKey, HistKey
+
+LEMMA NKFields ==
+    \A w, d : NK(w, d).tbl = "DIST" /\ NK(w, d).col = "nextoid" /\ NK(w, d).w = w /\ NK(w, d).d = d
+  BY KeyFields DEF NK
+
+LEMMA NKInj ==
+    \A w1, d1, w2, d2 : NK(w1, d1) = NK(w2, d2) => w1 = w2 /\ d1 = d2
+  BY NKFields
+
+LEMMA NOKFields ==
+    \A w, d, o : NOK(w, d, o).tbl = "NEWORDER" /\ NOK(w, d, o).w = w /\ NOK(w, d, o).d = d /\ NOK(w, d, o).o = o
+  BY KeyFields DEF NOK
+
+LEMMA NKInKeys ==
+    \A w \in WIds, d \in DIds : NK(w, d) \in Keys
+  <1> SUFFICES ASSUME NEW w \in WIds, NEW d \in DIds PROVE NK(w, d) \in Keys
     OBVIOUS
-  <2>1. SUFFICES ASSUME m+1 >= 1,
-                        \A i \in 1..(m+1) : r(p[i]) \in Nat /\ r(p[i+1]) \in Nat /\ r(p[i]) < r(p[i+1])
-                 PROVE  r(p[1]) + (m+1) <= r(p[(m+1)+1])
-    OBVIOUS
-  <2>2. CASE m = 0
-    BY <2>1, <2>2
-  <2>3. CASE m >= 1
-    <3>1. r(p[1]) + m <= r(p[m+1])
-      BY <2>1, <2>3
-    <3>2. r(p[m+1]) \in Nat /\ r(p[m+2]) \in Nat /\ r(p[m+1]) < r(p[m+2])
-      BY <2>1
-    <3>. QED
-      BY <3>1, <3>2
-  <2>. QED
-    BY <2>2, <2>3
-<1>3. \A m \in Nat : P(m)
-  BY <1>1, <1>2, NatInduction
-<1>. QED
-  BY <1>3
-
-LEMMA PathProperties ==
-  ASSUME NEW edges, NEW p \in SI!Paths(edges)
-  PROVE  /\ p \in Seq(SI!GraphNodes(edges))
-         /\ Len(p) \in Nat
-         /\ Len(p) >= 1
-         /\ \A i \in 1..(Len(p)-1) : <<p[i], p[i+1]>> \in edges
-<1> DEFINE nodes == SI!GraphNodes(edges)
-           maxLen == SI!PathBound(edges)
-<1>1. p \in UNION {[1..n -> nodes] : n \in 1..maxLen}
-      /\ \A i \in 1..(Len(p)-1) : <<p[i], p[i+1]>> \in edges
-  BY DEF SI!Paths
-<1>2. PICK n \in 1..maxLen : p \in [1..n -> nodes]
-  BY <1>1
-<1>3. n \in Nat /\ n >= 1
-  BY <1>2 DEF SI!PathBound
-<1>4. p \in Seq(nodes)
-  BY <1>2, <1>3
-<1>5. Len(p) = n
-  BY <1>2, <1>4, LenProperties
-<1>. QED
-  BY <1>1, <1>4, <1>5, <1>3
-
-LEMMA EmptyNoCycle == ~SI!IsCycleViaPath({})
-<1> SUFFICES ASSUME SI!IsCycleViaPath({})
-             PROVE  FALSE
-  OBVIOUS
-<1>1. PICK p \in SI!Paths({}) : Len(p) > 1 /\ p[1] = p[Len(p)]
-  BY DEF SI!IsCycleViaPath
-<1>2. Len(p) \in Nat
-  BY <1>1, PathProperties
-<1>3. 1 \in 1..(Len(p)-1)
-  BY <1>1, <1>2
-<1>4. <<p[1], p[2]>> \in {}
-  BY <1>1, <1>3, PathConsecutive
-<1>. QED
-  BY <1>4
-
-LEMMA EmptySerializable == SI!IsConflictSerializableViaPath(<<>>)
-BY EmptyGraph, EmptyNoCycle DEF SI!IsConflictSerializableViaPath
-
-LEMMA RankedNoCycle ==
-  ASSUME NEW edges,
-         NEW r(_),
-         \A e \in edges : r(e[1]) \in Nat /\ r(e[2]) \in Nat /\ r(e[1]) < r(e[2])
-  PROVE  ~SI!IsCycleViaPath(edges)
-<1> SUFFICES ASSUME SI!IsCycleViaPath(edges)
-             PROVE  FALSE
-  OBVIOUS
-<1>1. PICK p \in SI!Paths(edges) : Len(p) > 1 /\ p[1] = p[Len(p)]
-  BY DEF SI!IsCycleViaPath
-<1>2. p \in Seq(SI!GraphNodes(edges))
-      /\ Len(p) \in Nat
-      /\ Len(p) >= 1
-      /\ \A i \in 1..(Len(p)-1) : <<p[i], p[i+1]>> \in edges
-  BY <1>1, PathProperties
-<1>3. Len(p) - 1 \in Nat /\ Len(p) - 1 >= 1
-  BY <1>1, <1>2
-<1>4. \A i \in 1..(Len(p)-1) :
-         r(p[i]) \in Nat /\ r(p[i+1]) \in Nat /\ r(p[i]) < r(p[i+1])
-  <2> SUFFICES ASSUME NEW i \in 1..(Len(p)-1)
-               PROVE  r(p[i]) \in Nat /\ r(p[i+1]) \in Nat /\ r(p[i]) < r(p[i+1])
-    OBVIOUS
-  <2>1. <<p[i], p[i+1]>> \in edges
-    BY <1>2
-  <2>. QED
-    BY <2>1
-<1>5. r(p[1]) + (Len(p)-1) <= r(p[(Len(p)-1)+1])
-  BY <1>3, <1>4, RankAlongSeq
-<1>6. (Len(p)-1)+1 = Len(p)
-  BY <1>2, <1>3
-<1>7. r(p[1]) + (Len(p)-1) <= r(p[Len(p)])
-  BY <1>5, <1>6
-<1>8. r(p[1]) \in Nat
-  BY <1>1, <1>3, <1>4
-<1>9. r(p[1]) = r(p[Len(p)])
-  BY <1>1
-<1>. QED
-  BY <1>3, <1>7, <1>8, <1>9
-
------------------------------------------------------------------------------
-(*****************************************************************************)
-(* 3.  History facts H1--H3 and the rank                                     *)
-(*****************************************************************************)
-
-UniqueBegin(h) ==
-  \A op1, op2 \in Range(h) :
-    op1.type = "begin" /\ op2.type = "begin" /\ op1.txnId = op2.txnId => op1 = op2
-
-UniqueCommit(h) ==
-  \A op1, op2 \in Range(h) :
-    op1.type = "commit" /\ op2.type = "commit" /\ op1.txnId = op2.txnId => op1 = op2
-
-UniqueBody(h) ==
-  \A op1, op2 \in Range(h) :
-    op1.type = "body" /\ op2.type = "body" /\ op1.txnId = op2.txnId => op1 = op2
-
-TimedOpsOK(h) ==
-  \A op \in Range(h) :
-    op.type \in {"begin", "commit"} => "time" \in DOMAIN op /\ op.time \in Nat
-
-CommittedOK(h) ==
-  \A t \in SI!CommittedTxns(h) :
-    /\ \E b \in Range(h) : b.type = "begin" /\ b.txnId = t
-    /\ \E c \in Range(h) : c.type = "commit" /\ c.txnId = t
-
-H1(h) ==
-  \A b, c \in Range(h) :
-    b.type = "begin" /\ c.type = "commit" /\ b.txnId = c.txnId => b.time < c.time
-
-\* An updater that reads a key which some committed transaction writes
-\* must itself write that key.  Read-only columns of this mix (W_TAX, D_TAX,
-\* CUST.info, ITEM.info) are never written, so they are exempt.
-ReadOnlyCol(k) ==
-  /\ "tbl" \in DOMAIN k
-  /\ "col" \in DOMAIN k
-  /\ \/ /\ k.tbl = "WH"   /\ k.col = "tax"
-     \/ /\ k.tbl = "DIST" /\ k.col = "tax"
-     \/ /\ k.tbl = "CUST" /\ k.col = "info"
-     \/ /\ k.tbl = "ITEM" /\ k.col = "info"
-
-H2(h) ==
-  \A t \in SI!CommittedTxns(h) :
-    SI!KeysWrittenByTxn(h, t) # {} =>
-      \A k \in Keys :
-        SI!ReadsKey(h, t, k) /\ (\E t2 \in SI!CommittedTxns(h) : SI!WritesKey(h, t2, k))
-          => SI!WritesKey(h, t, k)
-
-H3(h) ==
-  \A t1, t2 \in SI!CommittedTxns(h) :
-    /\ t1 # t2
-    /\ SI!KeysWrittenByTxn(h, t1) \cap SI!KeysWrittenByTxn(h, t2) # {}
-    =>
-    \A b1, c1, b2, c2 \in Range(h) :
-      /\ b1.type = "begin"  /\ b1.txnId = t1
-      /\ c1.type = "commit" /\ c1.txnId = t1
-      /\ b2.type = "begin"  /\ b2.txnId = t2
-      /\ c2.type = "commit" /\ c2.txnId = t2
-      => c1.time < b2.time \/ c2.time < b1.time
-
-HistFacts(h) ==
-  /\ UniqueBegin(h)
-  /\ UniqueCommit(h)
-  /\ UniqueBody(h)
-  /\ TimedOpsOK(h)
-  /\ CommittedOK(h)
-  /\ H1(h)
-  /\ H2(h)
-  /\ H3(h)
-
-Rank(h, t) ==
-  IF SI!KeysWrittenByTxn(h, t) # {}
-  THEN SI!CommitOp(h, t).time
-  ELSE SI!BeginOp(h, t).time
-
-LEMMA ChooseExists ==
-  ASSUME NEW S, NEW P(_), \E x \in S : P(x)
-  PROVE  P(CHOOSE x \in S : P(x))
-<1>1. PICK y \in S : P(y)
-  OBVIOUS
-<1>. QED
-  OBVIOUS
-
-LEMMA ChooseBegin ==
-  ASSUME NEW h, NEW t,
-         \E b \in Range(h) : b.type = "begin" /\ b.txnId = t
-  PROVE  SI!BeginOp(h, t) \in Range(h)
-         /\ SI!BeginOp(h, t).type = "begin"
-         /\ SI!BeginOp(h, t).txnId = t
-<1> DEFINE P(op) == op.type = "begin" /\ op.txnId = t
-<1>1. P(CHOOSE op \in Range(h) : P(op))
-  BY ChooseExists
-<1>. QED
-  BY <1>1, RangeEq DEF SI!BeginOp
-
-LEMMA ChooseCommit ==
-  ASSUME NEW h, NEW t,
-         \E c \in Range(h) : c.type = "commit" /\ c.txnId = t
-  PROVE  SI!CommitOp(h, t) \in Range(h)
-         /\ SI!CommitOp(h, t).type = "commit"
-         /\ SI!CommitOp(h, t).txnId = t
-<1> DEFINE P(op) == op.type = "commit" /\ op.txnId = t
-<1>1. P(CHOOSE op \in Range(h) : P(op))
-  BY ChooseExists
-<1>. QED
-  BY <1>1, RangeEq DEF SI!CommitOp
-
-LEMMA BeginOpUnique ==
-  ASSUME NEW h, NEW t, UniqueBegin(h),
-         NEW b \in Range(h), b.type = "begin", b.txnId = t
-  PROVE  SI!BeginOp(h, t) = b
-<1>1. SI!BeginOp(h, t) \in Range(h)
-      /\ SI!BeginOp(h, t).type = "begin"
-      /\ SI!BeginOp(h, t).txnId = t
-  BY ChooseBegin
-<1>. QED
-  BY <1>1 DEF UniqueBegin
-
-LEMMA CommitOpUnique ==
-  ASSUME NEW h, NEW t, UniqueCommit(h),
-         NEW c \in Range(h), c.type = "commit", c.txnId = t
-  PROVE  SI!CommitOp(h, t) = c
-<1>1. SI!CommitOp(h, t) \in Range(h)
-      /\ SI!CommitOp(h, t).type = "commit"
-      /\ SI!CommitOp(h, t).txnId = t
-  BY ChooseCommit
-<1>. QED
-  BY <1>1 DEF UniqueCommit
-
-LEMMA RankType ==
-  ASSUME NEW h, NEW t \in SI!CommittedTxns(h), HistFacts(h)
-  PROVE  Rank(h, t) \in Nat
-<1>1. \E b \in Range(h) : b.type = "begin" /\ b.txnId = t
-      /\ \E c \in Range(h) : c.type = "commit" /\ c.txnId = t
-  BY DEF HistFacts, CommittedOK
-<1>2. SI!BeginOp(h, t) \in Range(h) /\ SI!BeginOp(h, t).type = "begin"
-  BY <1>1, ChooseBegin
-<1>3. SI!CommitOp(h, t) \in Range(h) /\ SI!CommitOp(h, t).type = "commit"
-  BY <1>1, ChooseCommit
-<1>4. SI!BeginOp(h, t).time \in Nat
-  BY <1>2 DEF HistFacts, TimedOpsOK
-<1>5. SI!CommitOp(h, t).time \in Nat
-  BY <1>3 DEF HistFacts, TimedOpsOK
-<1>. QED
-  BY <1>4, <1>5 DEF Rank
-
-LEMMA BeginTimeType ==
-  ASSUME NEW h, NEW t \in SI!CommittedTxns(h), HistFacts(h)
-  PROVE  SI!BeginOp(h, t).time \in Nat
-<1>1. \E b \in Range(h) : b.type = "begin" /\ b.txnId = t
-  BY DEF HistFacts, CommittedOK
-<1>2. SI!BeginOp(h, t) \in Range(h) /\ SI!BeginOp(h, t).type = "begin"
-  BY <1>1, ChooseBegin
-<1>. QED
-  BY <1>2 DEF HistFacts, TimedOpsOK
-
-LEMMA CommitTimeType ==
-  ASSUME NEW h, NEW t \in SI!CommittedTxns(h), HistFacts(h)
-  PROVE  SI!CommitOp(h, t).time \in Nat
-<1>1. \E c \in Range(h) : c.type = "commit" /\ c.txnId = t
-  BY DEF HistFacts, CommittedOK
-<1>2. SI!CommitOp(h, t) \in Range(h) /\ SI!CommitOp(h, t).type = "commit"
-  BY <1>1, ChooseCommit
-<1>. QED
-  BY <1>2 DEF HistFacts, TimedOpsOK
-
-LEMMA WroteMeansNonempty ==
-  ASSUME NEW h, NEW t, NEW k \in Keys,
-         SI!WritesKey(h, t, k)
-  PROVE  SI!KeysWrittenByTxn(h, t) # {}
-BY DEF SI!KeysWrittenByTxn, SI!WritesKey
-
-LEMMA WWEdgesRank ==
-  ASSUME NEW h, HistFacts(h),
-         NEW t1 \in SI!CommittedTxns(h), NEW t2 \in SI!CommittedTxns(h),
-         t1 # t2,
-         SI!WWDependency(h, t1, t2)
-  PROVE  Rank(h, t1) \in Nat /\ Rank(h, t2) \in Nat /\ Rank(h, t1) < Rank(h, t2)
-<1>1. PICK k \in Keys : SI!WritesKey(h, t1, k) /\ SI!WritesKey(h, t2, k)
-  BY DEF SI!WWDependency
-<1>2. SI!CommitOp(h, t1).time < SI!CommitOp(h, t2).time
-  BY DEF SI!WWDependency
-<1>3. SI!KeysWrittenByTxn(h, t1) # {}
-  BY <1>1, WroteMeansNonempty
-<1>4. SI!KeysWrittenByTxn(h, t2) # {}
-  BY <1>1, WroteMeansNonempty
-<1>5. Rank(h, t1) = SI!CommitOp(h, t1).time
-  BY <1>3 DEF Rank
-<1>6. Rank(h, t2) = SI!CommitOp(h, t2).time
-  BY <1>4 DEF Rank
-<1>7. Rank(h, t1) \in Nat
-  BY RankType
-<1>8. Rank(h, t2) \in Nat
-  BY RankType
-<1>. QED
-  BY <1>2, <1>5, <1>6, <1>7, <1>8
-
-LEMMA WREdgesRank ==
-  ASSUME NEW h, HistFacts(h),
-         NEW t1 \in SI!CommittedTxns(h), NEW t2 \in SI!CommittedTxns(h),
-         t1 # t2,
-         SI!WRDependency(h, t1, t2)
-  PROVE  Rank(h, t1) \in Nat /\ Rank(h, t2) \in Nat /\ Rank(h, t1) < Rank(h, t2)
-<1>1. PICK k \in Keys : SI!WritesKey(h, t1, k) /\ SI!ReadsKey(h, t2, k)
-  BY DEF SI!WRDependency
-<1>2. SI!CommitOp(h, t1).time < SI!BeginOp(h, t2).time
-  BY DEF SI!WRDependency
-<1>3. SI!KeysWrittenByTxn(h, t1) # {}
-  BY <1>1, WroteMeansNonempty
-<1>4. Rank(h, t1) = SI!CommitOp(h, t1).time
-  BY <1>3 DEF Rank
-<1>5. Rank(h, t1) \in Nat
-  BY RankType
-<1>6. SI!CommitOp(h, t1).time \in Nat
-  BY CommitTimeType
-<1>7. SI!BeginOp(h, t2).time \in Nat
-  BY BeginTimeType
-<1>8. CASE SI!KeysWrittenByTxn(h, t2) = {}
-  <2>1. Rank(h, t2) = SI!BeginOp(h, t2).time
-    BY <1>8 DEF Rank
-  <2>2. Rank(h, t2) \in Nat
-    BY <1>7, <2>1
-  <2>. QED
-    BY <1>2, <1>4, <1>5, <2>1, <2>2
-<1>9. CASE SI!KeysWrittenByTxn(h, t2) # {}
-  <2>1. Rank(h, t2) = SI!CommitOp(h, t2).time
-    BY <1>9 DEF Rank
-  <2>2. Rank(h, t2) \in Nat
-    BY RankType
-  <2>3. \E b \in Range(h) : b.type = "begin" /\ b.txnId = t2
-        /\ \E c \in Range(h) : c.type = "commit" /\ c.txnId = t2
-    BY DEF HistFacts, CommittedOK
-  <2>4. SI!BeginOp(h, t2).time < SI!CommitOp(h, t2).time
-    BY <2>3, ChooseBegin, ChooseCommit DEF HistFacts, H1
-  <2>. QED
-    BY <1>2, <1>4, <1>5, <1>6, <1>7, <2>1, <2>2, <2>4
-<1>. QED
-  BY <1>8, <1>9
-
-LEMMA RWEdgesRank ==
-  ASSUME NEW h, HistFacts(h),
-         NEW t1 \in SI!CommittedTxns(h), NEW t2 \in SI!CommittedTxns(h),
-         t1 # t2,
-         SI!RWDependency(h, t1, t2)
-  PROVE  Rank(h, t1) \in Nat /\ Rank(h, t2) \in Nat /\ Rank(h, t1) < Rank(h, t2)
-<1>1. PICK k \in Keys : SI!ReadsKey(h, t1, k) /\ SI!WritesKey(h, t2, k)
-  BY DEF SI!RWDependency
-<1>2. SI!BeginOp(h, t1).time < SI!CommitOp(h, t2).time
-  BY DEF SI!RWDependency
-<1>3. SI!KeysWrittenByTxn(h, t2) # {}
-  BY <1>1, WroteMeansNonempty
-<1>4. Rank(h, t2) = SI!CommitOp(h, t2).time
-  BY <1>3 DEF Rank
-<1>5. Rank(h, t2) \in Nat
-  BY RankType
-<1>6. SI!BeginOp(h, t1).time \in Nat
-  BY BeginTimeType
-<1>7. SI!CommitOp(h, t2).time \in Nat
-  BY CommitTimeType
-<1>8. CASE SI!KeysWrittenByTxn(h, t1) = {}
-  <2>1. Rank(h, t1) = SI!BeginOp(h, t1).time
-    BY <1>8 DEF Rank
-  <2>. QED
-    BY <1>2, <1>4, <1>5, <1>6, <2>1
-<1>9. CASE SI!KeysWrittenByTxn(h, t1) # {}
-  <2>1. Rank(h, t1) = SI!CommitOp(h, t1).time
-    BY <1>9 DEF Rank
-  <2>2. Rank(h, t1) \in Nat
-    BY RankType
-  <2>3. SI!WritesKey(h, t1, k)
-    BY <1>1, <1>3, <1>9 DEF HistFacts, H2
-  <2>4. k \in SI!KeysWrittenByTxn(h, t1) \cap SI!KeysWrittenByTxn(h, t2)
-    BY <1>1, <1>3, <2>3, WroteMeansNonempty DEF SI!KeysWrittenByTxn
-  <2>5. SI!KeysWrittenByTxn(h, t1) \cap SI!KeysWrittenByTxn(h, t2) # {}
-    BY <2>4
-  <2>6. \E b1 \in Range(h) : b1.type = "begin" /\ b1.txnId = t1
-        /\ \E c1 \in Range(h) : c1.type = "commit" /\ c1.txnId = t1
-        /\ \E b2 \in Range(h) : b2.type = "begin" /\ b2.txnId = t2
-        /\ \E c2 \in Range(h) : c2.type = "commit" /\ c2.txnId = t2
-    BY DEF HistFacts, CommittedOK
-  <2>7. SI!BeginOp(h, t1) \in Range(h) /\ SI!BeginOp(h, t1).type = "begin" /\ SI!BeginOp(h, t1).txnId = t1
-        /\ SI!CommitOp(h, t1) \in Range(h) /\ SI!CommitOp(h, t1).type = "commit" /\ SI!CommitOp(h, t1).txnId = t1
-        /\ SI!BeginOp(h, t2) \in Range(h) /\ SI!BeginOp(h, t2).type = "begin" /\ SI!BeginOp(h, t2).txnId = t2
-        /\ SI!CommitOp(h, t2) \in Range(h) /\ SI!CommitOp(h, t2).type = "commit" /\ SI!CommitOp(h, t2).txnId = t2
-    BY <2>6, ChooseBegin, ChooseCommit
-  <2>8. SI!CommitOp(h, t1).time < SI!BeginOp(h, t2).time
-        \/ SI!CommitOp(h, t2).time < SI!BeginOp(h, t1).time
-    BY <2>5, <2>7 DEF HistFacts, H3
-  <2>9. ~(SI!CommitOp(h, t2).time < SI!BeginOp(h, t1).time)
-    BY <1>2, <1>6, <1>7
-  <2>10. SI!CommitOp(h, t1).time < SI!BeginOp(h, t2).time
-    BY <2>8, <2>9
-  <2>11. SI!BeginOp(h, t2).time \in Nat
-    BY BeginTimeType
-  <2>12. SI!CommitOp(h, t1).time \in Nat
-    BY CommitTimeType
-  <2>13. \E b \in Range(h) : b.type = "begin" /\ b.txnId = t2
-         /\ \E c \in Range(h) : c.type = "commit" /\ c.txnId = t2
-    BY DEF HistFacts, CommittedOK
-  <2>14. SI!BeginOp(h, t2).time < SI!CommitOp(h, t2).time
-    BY <2>13, ChooseBegin, ChooseCommit DEF HistFacts, H1
-  <2>. QED
-    BY <2>1, <2>2, <1>4, <1>5, <2>10, <2>11, <2>12, <2>14, <1>7
-<1>. QED
-  BY <1>8, <1>9
-
-LEMMA GraphEdgeShape ==
-  ASSUME NEW h, NEW e \in SI!SerializationGraph(h)
-  PROVE  /\ e[1] \in SI!CommittedTxns(h)
-         /\ e[2] \in SI!CommittedTxns(h)
-         /\ e[1] # e[2]
-         /\ \/ SI!WWDependency(h, e[1], e[2])
-            \/ SI!WRDependency(h, e[1], e[2])
-            \/ SI!RWDependency(h, e[1], e[2])
-BY DEF SI!SerializationGraph
-
-LEMMA EdgesIncreaseRank ==
-  ASSUME NEW h, HistFacts(h),
-         NEW e \in SI!SerializationGraph(h)
-  PROVE  Rank(h, e[1]) \in Nat /\ Rank(h, e[2]) \in Nat /\ Rank(h, e[1]) < Rank(h, e[2])
-<1>1. e[1] \in SI!CommittedTxns(h) /\ e[2] \in SI!CommittedTxns(h) /\ e[1] # e[2]
-      /\ \/ SI!WWDependency(h, e[1], e[2])
-         \/ SI!WRDependency(h, e[1], e[2])
-         \/ SI!RWDependency(h, e[1], e[2])
-  BY GraphEdgeShape
-<1>2. CASE SI!WWDependency(h, e[1], e[2])
-  BY <1>1, <1>2, WWEdgesRank
-<1>3. CASE SI!WRDependency(h, e[1], e[2])
-  BY <1>1, <1>3, WREdgesRank
-<1>4. CASE SI!RWDependency(h, e[1], e[2])
-  BY <1>1, <1>4, RWEdgesRank
-<1>. QED
-  BY <1>1, <1>2, <1>3, <1>4
-
-LEMMA GraphNodesCommitted ==
-  ASSUME NEW h, NEW t \in SI!GraphNodes(SI!SerializationGraph(h))
-  PROVE  t \in SI!CommittedTxns(h)
-<1>1. PICK e \in SI!SerializationGraph(h) : t = e[1] \/ t = e[2]
-  BY DEF SI!GraphNodes
-<1>. QED
-  BY <1>1, GraphEdgeShape
-
-LEMMA TxnIdsFinite == IsFiniteSet(TxnIds)
-<1>1. TxnIds = 1..NumTxns
-  BY DEF TxnIds
-<1>2. NumTxns \in Nat
-  BY NumTxnsNat
-<1>. QED
-  BY <1>1, <1>2, FS_Interval
-
-LEMMA HistFactsSerializable ==
-  ASSUME NEW h, HistFacts(h)
-  PROVE  SI!IsConflictSerializableViaPath(h)
-<1> DEFINE edges == SI!SerializationGraph(h)
-           r(t) == Rank(h, t)
-<1>1. \A e \in edges : r(e[1]) \in Nat /\ r(e[2]) \in Nat /\ r(e[1]) < r(e[2])
-  BY EdgesIncreaseRank
-<1>2. ~SI!IsCycleViaPath(edges)
-  BY <1>1, RankedNoCycle
-<1>. QED
-  BY <1>2 DEF SI!IsConflictSerializableViaPath
-
------------------------------------------------------------------------------
-(*****************************************************************************)
-(* 4.  Workload lemma: NewOrder / Payment / StockLevel satisfy H2            *)
-(*****************************************************************************)
-
-BodyH2(B) ==
-  B.writes # {} =>
-    \A k \in B.reads :
-      \/ \E w \in B.writes : w.key = k
-      \/ ReadOnlyCol(k)
-
-NoWriteRO(h) ==
-  \A op \in Range(h) :
-    op.type = "body" =>
-      \A w \in op.writes : ~ReadOnlyCol(w.key)
-
-LEMMA ColumnTrue == ColumnGranularity
-BY ColumnMode
-
-LEMMA RdKeysDef ==
-  ASSUME NEW base, NEW cols
-  PROVE  RdKeys(base, cols) = {Item(base, c) : c \in cols}
-BY ColumnTrue DEF RdKeys
-
-LEMMA WrOpsDef ==
-  ASSUME NEW snap, NEW base, NEW upd
-  PROVE  WrOps(snap, base, upd) =
-           {[type |-> "write", key |-> Item(base, c), val |-> upd[c]] : c \in DOMAIN upd}
-BY ColumnTrue DEF WrOps
-
-LEMMA ItemCol ==
-  ASSUME NEW base, NEW col
-  PROVE  Item(base, col).col = col
-<1>1. Item(base, col) = [x \in (DOMAIN base) \cup {"col"} |->
-                           IF x = "col" THEN col ELSE base[x]]
-  BY ColumnTrue DEF Item
-<1>2. "col" \in (DOMAIN base) \cup {"col"}
-  OBVIOUS
-<1>. QED
-  BY <1>1, <1>2
-
-LEMMA ItemTbl ==
-  ASSUME NEW base, NEW col, "tbl" \in DOMAIN base
-  PROVE  Item(base, col).tbl = base.tbl
-<1>1. Item(base, col) = [x \in (DOMAIN base) \cup {"col"} |->
-                           IF x = "col" THEN col ELSE base[x]]
-  BY ColumnTrue DEF Item
-<1>2. "tbl" \in (DOMAIN base) \cup {"col"}
-  OBVIOUS
-<1>3. "tbl" # "col"
-  OBVIOUS
-<1>. QED
-  BY <1>1, <1>2, <1>3
-
-LEMMA WhKeyShape ==
-  ASSUME NEW w
-  PROVE  WhKey(w).tbl = "WH" /\ "tbl" \in DOMAIN WhKey(w)
-BY DEF WhKey
-
-LEMMA DistKeyShape ==
-  ASSUME NEW w, NEW d
-  PROVE  DistKey(w, d).tbl = "DIST" /\ "tbl" \in DOMAIN DistKey(w, d)
-BY DEF DistKey
-
-LEMMA CustKeyShape ==
-  ASSUME NEW w, NEW d, NEW c
-  PROVE  CustKey(w, d, c).tbl = "CUST" /\ "tbl" \in DOMAIN CustKey(w, d, c)
-BY DEF CustKey
-
-LEMMA ItemKeyShape ==
-  ASSUME NEW i
-  PROVE  ItemKey(i).tbl = "ITEM" /\ "tbl" \in DOMAIN ItemKey(i)
-BY DEF ItemKey
-
-LEMMA StockKeyShape ==
-  ASSUME NEW w, NEW i
-  PROVE  StockKey(w, i).tbl = "STOCK" /\ "tbl" \in DOMAIN StockKey(w, i)
-BY DEF StockKey
-
-LEMMA OrderKeyShape ==
-  ASSUME NEW w, NEW d, NEW o
-  PROVE  OrderKey(w, d, o).tbl = "ORDER" /\ "tbl" \in DOMAIN OrderKey(w, d, o)
-BY DEF OrderKey
-
-LEMMA NewOrdKeyShape ==
-  ASSUME NEW w, NEW d, NEW o
-  PROVE  NewOrdKey(w, d, o).tbl = "NEWORDER" /\ "tbl" \in DOMAIN NewOrdKey(w, d, o)
-BY DEF NewOrdKey
-
-LEMMA OrdLineKeyShape ==
-  ASSUME NEW w, NEW d, NEW o
-  PROVE  OrdLineKey(w, d, o).tbl = "ORDERLINE" /\ "tbl" \in DOMAIN OrdLineKey(w, d, o)
-BY DEF OrdLineKey
-
-LEMMA HistKeyShape ==
-  ASSUME NEW t
-  PROVE  HistKey(t).tbl = "HIST" /\ "tbl" \in DOMAIN HistKey(t)
-BY DEF HistKey
-
-LEMMA WhTaxRO ==
-  ASSUME NEW w
-  PROVE  ReadOnlyCol(Item(WhKey(w), "tax"))
-<1>1. Item(WhKey(w), "tax").tbl = "WH"
-  BY WhKeyShape, ItemTbl
-<1>2. Item(WhKey(w), "tax").col = "tax"
-  BY ItemCol
-<1>3. "tbl" \in DOMAIN Item(WhKey(w), "tax")
-  BY ColumnTrue, WhKeyShape DEF Item
-<1>4. "col" \in DOMAIN Item(WhKey(w), "tax")
-  BY ColumnTrue DEF Item
-<1>. QED
-  BY <1>1, <1>2, <1>3, <1>4 DEF ReadOnlyCol
-
-LEMMA DistTaxRO ==
-  ASSUME NEW w, NEW d
-  PROVE  ReadOnlyCol(Item(DistKey(w, d), "tax"))
-<1>1. Item(DistKey(w, d), "tax").tbl = "DIST"
-  BY DistKeyShape, ItemTbl
-<1>2. Item(DistKey(w, d), "tax").col = "tax"
-  BY ItemCol
-<1>3. "tbl" \in DOMAIN Item(DistKey(w, d), "tax")
-  BY ColumnTrue, DistKeyShape DEF Item
-<1>4. "col" \in DOMAIN Item(DistKey(w, d), "tax")
-  BY ColumnTrue DEF Item
-<1>. QED
-  BY <1>1, <1>2, <1>3, <1>4 DEF ReadOnlyCol
-
-LEMMA CustInfoRO ==
-  ASSUME NEW w, NEW d, NEW c
-  PROVE  ReadOnlyCol(Item(CustKey(w, d, c), "info"))
-<1>1. Item(CustKey(w, d, c), "info").tbl = "CUST"
-  BY CustKeyShape, ItemTbl
-<1>2. Item(CustKey(w, d, c), "info").col = "info"
-  BY ItemCol
-<1>3. "tbl" \in DOMAIN Item(CustKey(w, d, c), "info")
-  BY ColumnTrue, CustKeyShape DEF Item
-<1>4. "col" \in DOMAIN Item(CustKey(w, d, c), "info")
-  BY ColumnTrue DEF Item
-<1>. QED
-  BY <1>1, <1>2, <1>3, <1>4 DEF ReadOnlyCol
-
-LEMMA ItemInfoRO ==
-  ASSUME NEW i
-  PROVE  ReadOnlyCol(Item(ItemKey(i), "info"))
-<1>1. Item(ItemKey(i), "info").tbl = "ITEM"
-  BY ItemKeyShape, ItemTbl
-<1>2. Item(ItemKey(i), "info").col = "info"
-  BY ItemCol
-<1>3. "tbl" \in DOMAIN Item(ItemKey(i), "info")
-  BY ColumnTrue, ItemKeyShape DEF Item
-<1>4. "col" \in DOMAIN Item(ItemKey(i), "info")
-  BY ColumnTrue DEF Item
-<1>. QED
-  BY <1>1, <1>2, <1>3, <1>4 DEF ReadOnlyCol
-
-LEMMA ItemNotRO ==
-  ASSUME NEW base, NEW col,
-         "tbl" \in DOMAIN base,
-         ~(/\ base.tbl = "WH"   /\ col = "tax")
-         /\ ~(/\ base.tbl = "DIST" /\ col = "tax")
-         /\ ~(/\ base.tbl = "CUST" /\ col = "info")
-         /\ ~(/\ base.tbl = "ITEM" /\ col = "info")
-  PROVE  ~ReadOnlyCol(Item(base, col))
-<1>1. Item(base, col).tbl = base.tbl
-  BY ItemTbl
-<1>2. Item(base, col).col = col
-  BY ItemCol
-<1>. QED
-  BY <1>1, <1>2 DEF ReadOnlyCol
-
-LEMMA WrOpsWritesItem ==
-  ASSUME NEW snap, NEW base, NEW upd, NEW c \in DOMAIN upd
-  PROVE  \E w \in WrOps(snap, base, upd) : w.key = Item(base, c)
-<1>1. [type |-> "write", key |-> Item(base, c), val |-> upd[c]] \in WrOps(snap, base, upd)
-  BY WrOpsDef
-<1>. QED
-  BY <1>1
-
-LEMMA MixNoOS == "OrderStatus" \notin EnabledTxnTypes
-BY RobustMix
-
-LEMMA MixNoDelivery == "Delivery" \notin EnabledTxnTypes
-BY RobustMix
-
-LEMMA RequestType ==
-  ASSUME NEW req \in Requests
-  PROVE  req.type \in {"NewOrder", "Payment", "StockLevel"}
-<1>1. EnabledTxnTypes \subseteq {"NewOrder", "Payment", "StockLevel"}
-  BY RobustMix
-<1>2. "OrderStatus" \notin EnabledTxnTypes
-  BY MixNoOS
-<1>3. "Delivery" \notin EnabledTxnTypes
-  BY MixNoDelivery
-<1>. QED
-  BY <1>1, <1>2, <1>3 DEF Requests
-
-LEMMA ProgramForNewOrder ==
-  ASSUME NEW tid, NEW req, NEW snap, req.type = "NewOrder"
-  PROVE  ProgramFor(tid, req, snap) = NewOrderProgram(req, snap)
-BY DEF ProgramFor
-
-LEMMA ProgramForPayment ==
-  ASSUME NEW tid, NEW req, NEW snap, req.type = "Payment"
-  PROVE  ProgramFor(tid, req, snap) = PaymentProgram(tid, req, snap)
-BY DEF ProgramFor
-
-LEMMA ProgramForStockLevel ==
-  ASSUME NEW tid, NEW req, NEW snap, req.type = "StockLevel"
-  PROVE  ProgramFor(tid, req, snap) = StockLevelProgram(req, snap)
-BY DEF ProgramFor
-
-LEMMA PaymentH2 ==
-  ASSUME NEW tid, NEW req, NEW snap
-  PROVE  BodyH2(PaymentProgram(tid, req, snap))
-<1> DEFINE B == PaymentProgram(tid, req, snap)
-           w == req.w
-           d == req.d
-           cw == req.cw
-           cd == req.cd
-           c == req.c
-<1>1. B.reads = RdKeys(WhKey(w), {"ytd"})
-                \cup RdKeys(DistKey(w, d), {"ytd"})
-                \cup RdKeys(CustKey(cw, cd, c), {"balance"})
-  BY DEF PaymentProgram
-<1>2. B.writes = WrOps(snap, WhKey(w), [ytd |-> Tag])
-                 \cup WrOps(snap, DistKey(w, d), [ytd |-> Tag])
-                 \cup WrOps(snap, CustKey(cw, cd, c), [balance |-> Tag])
-                 \cup WrOps(snap, HistKey(tid), [row |-> Tag])
-  BY DEF PaymentProgram
-<1> SUFFICES ASSUME B.writes # {}, NEW k \in B.reads
-             PROVE  \E wr \in B.writes : wr.key = k
-  BY DEF BodyH2
-<1>3. k = Item(WhKey(w), "ytd")
-      \/ k = Item(DistKey(w, d), "ytd")
-      \/ k = Item(CustKey(cw, cd, c), "balance")
-  BY <1>1, RdKeysDef
-<1>4. "ytd" \in DOMAIN [ytd |-> Tag]
-  OBVIOUS
-<1>5. "balance" \in DOMAIN [balance |-> Tag]
-  OBVIOUS
-<1>6. CASE k = Item(WhKey(w), "ytd")
-  <2>1. \E wr \in WrOps(snap, WhKey(w), [ytd |-> Tag]) : wr.key = Item(WhKey(w), "ytd")
-    BY <1>4, WrOpsWritesItem
-  <2>. QED
-    BY <1>2, <1>6, <2>1
-<1>7. CASE k = Item(DistKey(w, d), "ytd")
-  <2>1. \E wr \in WrOps(snap, DistKey(w, d), [ytd |-> Tag]) : wr.key = Item(DistKey(w, d), "ytd")
-    BY <1>4, WrOpsWritesItem
-  <2>. QED
-    BY <1>2, <1>7, <2>1
-<1>8. CASE k = Item(CustKey(cw, cd, c), "balance")
-  <2>1. \E wr \in WrOps(snap, CustKey(cw, cd, c), [balance |-> Tag]) :
-           wr.key = Item(CustKey(cw, cd, c), "balance")
-    BY <1>5, WrOpsWritesItem
-  <2>. QED
-    BY <1>2, <1>8, <2>1
-<1>. QED
-  BY <1>3, <1>6, <1>7, <1>8
-
-LEMMA StockLevelH2 ==
-  ASSUME NEW req, NEW snap
-  PROVE  BodyH2(StockLevelProgram(req, snap))
-<1>1. StockLevelProgram(req, snap).writes = {}
-  BY DEF StockLevelProgram
-<1>. QED
-  BY <1>1 DEF BodyH2
-
-LEMMA NewOrderH2 ==
-  ASSUME NEW req, NEW snap
-  PROVE  BodyH2(NewOrderProgram(req, snap))
-<1> DEFINE B == NewOrderProgram(req, snap)
-           w == req.w
-           d == req.d
-           c == req.c
-           sw == req.sw
-           items == req.items
-           o == ColVal(snap, DistKey(w, d), "nextoid")
-<1>1. B.reads = RdKeys(WhKey(w), {"tax"})
-                \cup RdKeys(DistKey(w, d), {"tax", "nextoid"})
-                \cup RdKeys(CustKey(w, d, c), {"info"})
-                \cup (UNION {RdKeys(ItemKey(i), {"info"}) : i \in items})
-                \cup (UNION {RdKeys(StockKey(sw, i), {"qty"}) : i \in items})
-  BY DEF NewOrderProgram
-<1>2. B.writes = WrOps(snap, DistKey(w, d), [nextoid |-> o + 1])
-                 \cup (UNION {WrOps(snap, StockKey(sw, i), [qty |-> Tag]) : i \in items})
-                 \cup WrOps(snap, OrderKey(w, d, o), [hdr |-> c, carrier |-> Tag])
-                 \cup WrOps(snap, NewOrdKey(w, d, o), [row |-> Tag])
-                 \cup WrOps(snap, OrdLineKey(w, d, o), [items |-> items, delivery |-> Tag])
-  BY DEF NewOrderProgram
-<1> SUFFICES ASSUME B.writes # {}, NEW k \in B.reads
-             PROVE  \/ \E wr \in B.writes : wr.key = k
-                    \/ ReadOnlyCol(k)
-  BY DEF BodyH2
-<1>3. \/ k \in RdKeys(WhKey(w), {"tax"})
-      \/ k \in RdKeys(DistKey(w, d), {"tax", "nextoid"})
-      \/ k \in RdKeys(CustKey(w, d, c), {"info"})
-      \/ \E i \in items : k \in RdKeys(ItemKey(i), {"info"})
-      \/ \E i \in items : k \in RdKeys(StockKey(sw, i), {"qty"})
-  BY <1>1
-<1>4. CASE k \in RdKeys(WhKey(w), {"tax"})
-  <2>1. k = Item(WhKey(w), "tax")
-    BY <1>4, RdKeysDef
-  <2>. QED
-    BY <2>1, WhTaxRO
-<1>5. CASE k \in RdKeys(DistKey(w, d), {"tax", "nextoid"})
-  <2>1. k = Item(DistKey(w, d), "tax") \/ k = Item(DistKey(w, d), "nextoid")
-    BY <1>5, RdKeysDef
-  <2>2. CASE k = Item(DistKey(w, d), "tax")
-    BY <2>2, DistTaxRO
-  <2>3. CASE k = Item(DistKey(w, d), "nextoid")
-    <3>1. "nextoid" \in DOMAIN [nextoid |-> o + 1]
+  <1>1. DistKey(w, d) \in RowKeys
+    <2>1. <<w, d>> \in WIds \X DIds /\ DistKey(w, d) = DistKey(<<w, d>>[1], <<w, d>>[2])
       OBVIOUS
-    <3>2. \E wr \in WrOps(snap, DistKey(w, d), [nextoid |-> o + 1]) :
-             wr.key = Item(DistKey(w, d), "nextoid")
-      BY <3>1, WrOpsWritesItem
-    <3>. QED
-      BY <1>2, <2>3, <3>2
-  <2>. QED
-    BY <2>1, <2>2, <2>3
-<1>6. CASE k \in RdKeys(CustKey(w, d, c), {"info"})
-  <2>1. k = Item(CustKey(w, d, c), "info")
-    BY <1>6, RdKeysDef
-  <2>. QED
-    BY <2>1, CustInfoRO
-<1>7. CASE \E i \in items : k \in RdKeys(ItemKey(i), {"info"})
-  <2>1. PICK i \in items : k \in RdKeys(ItemKey(i), {"info"})
-    BY <1>7
-  <2>2. k = Item(ItemKey(i), "info")
-    BY <2>1, RdKeysDef
-  <2>. QED
-    BY <2>2, ItemInfoRO
-<1>8. CASE \E i \in items : k \in RdKeys(StockKey(sw, i), {"qty"})
-  <2>1. PICK i \in items : k \in RdKeys(StockKey(sw, i), {"qty"})
-    BY <1>8
-  <2>2. k = Item(StockKey(sw, i), "qty")
-    BY <2>1, RdKeysDef
-  <2>3. "qty" \in DOMAIN [qty |-> Tag]
+    <2> QED
+      BY <2>1 DEF RowKeys
+  <1>2. "nextoid" \in ColsOf(DistKey(w, d).tbl)
+    BY DEF ColsOf, DistKey
+  <1> QED
+    BY <1>1, <1>2, CGAssm DEF Keys, NK
+
+LEMMA NOKInKeys ==
+    \A w \in WIds, d \in DIds, o \in OIds : NOK(w, d, o) \in Keys
+  <1> SUFFICES ASSUME NEW w \in WIds, NEW d \in DIds, NEW o \in OIds PROVE NOK(w, d, o) \in Keys
     OBVIOUS
-  <2>4. \E wr \in WrOps(snap, StockKey(sw, i), [qty |-> Tag]) :
-           wr.key = Item(StockKey(sw, i), "qty")
-    BY <2>3, WrOpsWritesItem
-  <2>. QED
-    BY <1>2, <2>2, <2>4
-<1>. QED
-  BY <1>3, <1>4, <1>5, <1>6, <1>7, <1>8
+  <1>1. NewOrdKey(w, d, o) \in RowKeys
+    <2>1. <<w, d, o>> \in WIds \X DIds \X OIds /\ NewOrdKey(w, d, o) = NewOrdKey(<<w, d, o>>[1], <<w, d, o>>[2], <<w, d, o>>[3])
+      OBVIOUS
+    <2> QED
+      BY <2>1 DEF RowKeys
+  <1>2. "row" \in ColsOf(NewOrdKey(w, d, o).tbl)
+    BY DEF ColsOf, NewOrdKey
+  <1> QED
+    BY <1>1, <1>2, CGAssm DEF Keys, NOK
 
-LEMMA PaymentNoROWrite ==
-  ASSUME NEW tid, NEW req, NEW snap, NEW wr \in PaymentProgram(tid, req, snap).writes
-  PROVE  ~ReadOnlyCol(wr.key)
-<1> DEFINE w == req.w
-           d == req.d
-           cw == req.cw
-           cd == req.cd
-           c == req.c
-<1>1. wr \in WrOps(snap, WhKey(w), [ytd |-> Tag])
-      \/ wr \in WrOps(snap, DistKey(w, d), [ytd |-> Tag])
-      \/ wr \in WrOps(snap, CustKey(cw, cd, c), [balance |-> Tag])
-      \/ wr \in WrOps(snap, HistKey(tid), [row |-> Tag])
-  BY DEF PaymentProgram
-<1>2. CASE wr \in WrOps(snap, WhKey(w), [ytd |-> Tag])
-  <2>1. PICK col \in DOMAIN [ytd |-> Tag] :
-          wr.key = Item(WhKey(w), col)
-    BY <1>2, WrOpsDef
-  <2>2. col = "ytd"
-    BY <2>1
-  <2>3. WhKey(w).tbl = "WH"
-    BY WhKeyShape
-  <2>. QED
-    BY <2>1, <2>2, <2>3, WhKeyShape, ItemNotRO
-<1>3. CASE wr \in WrOps(snap, DistKey(w, d), [ytd |-> Tag])
-  <2>1. PICK col \in DOMAIN [ytd |-> Tag] :
-          wr.key = Item(DistKey(w, d), col)
-    BY <1>3, WrOpsDef
-  <2>2. col = "ytd"
-    BY <2>1
-  <2>3. DistKey(w, d).tbl = "DIST"
-    BY DistKeyShape
-  <2>. QED
-    BY <2>1, <2>2, <2>3, DistKeyShape, ItemNotRO
-<1>4. CASE wr \in WrOps(snap, CustKey(cw, cd, c), [balance |-> Tag])
-  <2>1. PICK col \in DOMAIN [balance |-> Tag] :
-          wr.key = Item(CustKey(cw, cd, c), col)
-    BY <1>4, WrOpsDef
-  <2>2. col = "balance"
-    BY <2>1
-  <2>3. CustKey(cw, cd, c).tbl = "CUST"
-    BY CustKeyShape
-  <2>. QED
-    BY <2>1, <2>2, <2>3, CustKeyShape, ItemNotRO
-<1>5. CASE wr \in WrOps(snap, HistKey(tid), [row |-> Tag])
-  <2>1. PICK col \in DOMAIN [row |-> Tag] :
-          wr.key = Item(HistKey(tid), col)
-    BY <1>5, WrOpsDef
-  <2>2. col = "row"
-    BY <2>1
-  <2>3. HistKey(tid).tbl = "HIST"
-    BY HistKeyShape
-  <2>. QED
-    BY <2>1, <2>2, <2>3, HistKeyShape, ItemNotRO
-<1>. QED
-  BY <1>1, <1>2, <1>3, <1>4, <1>5
+(***************************************************************************)
+(* Generic lemmas about histories.                                         *)
+(***************************************************************************)
 
-LEMMA StockLevelNoROWrite ==
-  ASSUME NEW req, NEW snap, NEW wr \in StockLevelProgram(req, snap).writes
-  PROVE  ~ReadOnlyCol(wr.key)
-<1>1. StockLevelProgram(req, snap).writes = {}
-  BY DEF StockLevelProgram
-<1>. QED
-  BY <1>1
-
-LEMMA NewOrderNoROWrite ==
-  ASSUME NEW req, NEW snap, NEW wr \in NewOrderProgram(req, snap).writes
-  PROVE  ~ReadOnlyCol(wr.key)
-<1> DEFINE B == NewOrderProgram(req, snap)
-           w == req.w
-           d == req.d
-           c == req.c
-           sw == req.sw
-           items == req.items
-           o == ColVal(snap, DistKey(w, d), "nextoid")
-<1>0. B.writes = WrOps(snap, DistKey(w, d), [nextoid |-> o + 1])
-                 \cup (UNION {WrOps(snap, StockKey(sw, i), [qty |-> Tag]) : i \in items})
-                 \cup WrOps(snap, OrderKey(w, d, o), [hdr |-> c, carrier |-> Tag])
-                 \cup WrOps(snap, NewOrdKey(w, d, o), [row |-> Tag])
-                 \cup WrOps(snap, OrdLineKey(w, d, o), [items |-> items, delivery |-> Tag])
-  BY DEF NewOrderProgram
-<1>1. wr \in WrOps(snap, DistKey(w, d), [nextoid |-> o + 1])
-      \/ wr \in UNION {WrOps(snap, StockKey(sw, i), [qty |-> Tag]) : i \in items}
-      \/ wr \in WrOps(snap, OrderKey(w, d, o), [hdr |-> c, carrier |-> Tag])
-      \/ wr \in WrOps(snap, NewOrdKey(w, d, o), [row |-> Tag])
-      \/ wr \in WrOps(snap, OrdLineKey(w, d, o), [items |-> items, delivery |-> Tag])
-  BY <1>0
-<1>2. CASE wr \in WrOps(snap, DistKey(w, d), [nextoid |-> o + 1])
-  <2>1. PICK col \in DOMAIN [nextoid |-> o + 1] : wr.key = Item(DistKey(w, d), col)
-    BY <1>2, WrOpsDef
-  <2>2. col = "nextoid"
-    BY <2>1
-  <2>3. DistKey(w, d).tbl = "DIST"
-    BY DistKeyShape
-  <2>. QED
-    BY <2>1, <2>2, <2>3, DistKeyShape, ItemNotRO
-<1>3. CASE wr \in UNION {WrOps(snap, StockKey(sw, i), [qty |-> Tag]) : i \in items}
-  <2>1. PICK i \in items : wr \in WrOps(snap, StockKey(sw, i), [qty |-> Tag])
-    BY <1>3
-  <2>2. PICK col \in DOMAIN [qty |-> Tag] : wr.key = Item(StockKey(sw, i), col)
-    BY <2>1, WrOpsDef
-  <2>3. col = "qty"
-    BY <2>2
-  <2>4. StockKey(sw, i).tbl = "STOCK"
-    BY StockKeyShape
-  <2>. QED
-    BY <2>2, <2>3, <2>4, StockKeyShape, ItemNotRO
-<1>4. CASE wr \in WrOps(snap, OrderKey(w, d, o), [hdr |-> c, carrier |-> Tag])
-  <2>1. PICK col \in DOMAIN [hdr |-> c, carrier |-> Tag] :
-          wr.key = Item(OrderKey(w, d, o), col)
-    BY <1>4, WrOpsDef
-  <2>2. col = "hdr" \/ col = "carrier"
-    BY <2>1
-  <2>3. OrderKey(w, d, o).tbl = "ORDER"
-    BY OrderKeyShape
-  <2>. QED
-    BY <2>1, <2>2, <2>3, OrderKeyShape, ItemNotRO
-<1>5. CASE wr \in WrOps(snap, NewOrdKey(w, d, o), [row |-> Tag])
-  <2>1. PICK col \in DOMAIN [row |-> Tag] : wr.key = Item(NewOrdKey(w, d, o), col)
-    BY <1>5, WrOpsDef
-  <2>2. col = "row"
-    BY <2>1
-  <2>3. NewOrdKey(w, d, o).tbl = "NEWORDER"
-    BY NewOrdKeyShape
-  <2>. QED
-    BY <2>1, <2>2, <2>3, NewOrdKeyShape, ItemNotRO
-<1>6. CASE wr \in WrOps(snap, OrdLineKey(w, d, o), [items |-> items, delivery |-> Tag])
-  <2>1. PICK col \in DOMAIN [items |-> items, delivery |-> Tag] :
-          wr.key = Item(OrdLineKey(w, d, o), col)
-    BY <1>6, WrOpsDef
-  <2>2. col = "items" \/ col = "delivery"
-    BY <2>1
-  <2>3. OrdLineKey(w, d, o).tbl = "ORDERLINE"
-    BY OrdLineKeyShape
-  <2>. QED
-    BY <2>1, <2>2, <2>3, OrdLineKeyShape, ItemNotRO
-<1>. QED
-  BY <1>1, <1>2, <1>3, <1>4, <1>5, <1>6
-
-LEMMA WorkloadH2 ==
-  ASSUME NEW tid, NEW req \in Requests, NEW snap
-  PROVE  BodyH2(ProgramFor(tid, req, snap))
-<1>1. req.type \in {"NewOrder", "Payment", "StockLevel"}
-  BY RequestType
-<1>2. CASE req.type = "NewOrder"
-  <2>1. ProgramFor(tid, req, snap) = NewOrderProgram(req, snap)
-    BY <1>2, ProgramForNewOrder
-  <2>. QED
-    BY <1>2, <2>1, NewOrderH2
-<1>3. CASE req.type = "Payment"
-  <2>1. ProgramFor(tid, req, snap) = PaymentProgram(tid, req, snap)
-    BY <1>3, ProgramForPayment
-  <2>. QED
-    BY <1>3, <2>1, PaymentH2
-<1>4. CASE req.type = "StockLevel"
-  <2>1. ProgramFor(tid, req, snap) = StockLevelProgram(req, snap)
-    BY <1>4, ProgramForStockLevel
-  <2>. QED
-    BY <1>4, <2>1, StockLevelH2
-<1>. QED
-  BY <1>1, <1>2, <1>3, <1>4
-
-LEMMA WorkloadNoROWrite ==
-  ASSUME NEW tid, NEW req \in Requests, NEW snap,
-         NEW wr \in ProgramFor(tid, req, snap).writes
-  PROVE  ~ReadOnlyCol(wr.key)
-<1>1. req.type \in {"NewOrder", "Payment", "StockLevel"}
-  BY RequestType
-<1>2. CASE req.type = "NewOrder"
-  <2>1. ProgramFor(tid, req, snap) = NewOrderProgram(req, snap)
-    BY <1>2, ProgramForNewOrder
-  <2>. QED
-    BY <1>2, <2>1, NewOrderNoROWrite
-<1>3. CASE req.type = "Payment"
-  <2>1. ProgramFor(tid, req, snap) = PaymentProgram(tid, req, snap)
-    BY <1>3, ProgramForPayment
-  <2>. QED
-    BY <1>3, <2>1, PaymentNoROWrite
-<1>4. CASE req.type = "StockLevel"
-  <2>1. ProgramFor(tid, req, snap) = StockLevelProgram(req, snap)
-    BY <1>4, ProgramForStockLevel
-  <2>. QED
-    BY <1>4, <2>1, StockLevelNoROWrite
-<1>. QED
-  BY <1>1, <1>2, <1>3, <1>4
-
-LEMMA ProgramHasRW ==
-  ASSUME NEW tid, NEW req \in Requests, NEW snap
-  PROVE  /\ "reads" \in DOMAIN ProgramFor(tid, req, snap)
-         /\ "writes" \in DOMAIN ProgramFor(tid, req, snap)
-<1>1. req.type \in {"NewOrder", "Payment", "StockLevel"}
-  BY RequestType
-<1>2. CASE req.type = "NewOrder"
-  BY <1>2, ProgramForNewOrder DEF NewOrderProgram
-<1>3. CASE req.type = "Payment"
-  BY <1>3, ProgramForPayment DEF PaymentProgram
-<1>4. CASE req.type = "StockLevel"
-  BY <1>4, ProgramForStockLevel DEF StockLevelProgram
-<1>. QED
-  BY <1>1, <1>2, <1>3, <1>4
-
------------------------------------------------------------------------------
-(*****************************************************************************)
-(* 5.  Sequence infrastructure                                               *)
-(*****************************************************************************)
-
-LEMMA PairSeq ==
-  ASSUME NEW a, NEW b
-  PROVE  <<a, b>> \in Seq({a, b})
-<1>1. <<>> \in Seq({a, b})
-  BY EmptySeq
-<1>2. Append(<<>>, a) \in Seq({a, b})
-  BY <1>1, AppendProperties
-<1>3. Append(<<>>, a) = <<a>>
-  OBVIOUS
-<1>4. Append(<<a>>, b) \in Seq({a, b})
-  BY <1>2, <1>3, AppendProperties
-<1>5. Append(<<a>>, b) = <<a, b>>
-  OBVIOUS
-<1>. QED
-  BY <1>4, <1>5
-
-LEMMA RangePair ==
-  ASSUME NEW a, NEW b
-  PROVE  Range(<<a, b>>) = {a, b}
-<1>1. <<a, b>> \in Seq({a, b})
-  BY PairSeq
-<1>2. Range(<<a, b>>) = { <<a, b>>[i] : i \in 1..2 }
-  BY <1>1, RangeEquality
-<1>. QED
-  BY <1>1, <1>2, LenProperties
-
-LEMMA HistSeqAppend ==
-  ASSUME NEW S, NEW h \in Seq(S), NEW x
-  PROVE  Append(h, x) \in Seq(S \cup {x})
-<1>1. h \in Seq(S \cup {x})
-  BY SeqMonotonic
-<1>. QED
-  BY <1>1, AppendProperties
-
-LEMMA HistSeqConcatPair ==
-  ASSUME NEW S, NEW h \in Seq(S), NEW a, NEW b
-  PROVE  h \o <<a, b>> \in Seq(S \cup {a, b})
-<1>1. h \in Seq(S \cup {a, b})
-  BY SeqMonotonic
-<1>2. <<a, b>> \in Seq({a, b})
-  BY PairSeq
-<1>3. <<a, b>> \in Seq(S \cup {a, b})
-  BY <1>2, SeqMonotonic
-<1>. QED
-  BY <1>1, <1>3, ConcatProperties
+LEMMA SeqInOwnRange ==
+    ASSUME NEW S, NEW s \in Seq(S)
+    PROVE  s \in Seq(Ops(s))
+  <1>0. Len(s) \in Nat /\ s \in [1..Len(s) -> S] /\ DOMAIN s = 1..Len(s)
+    BY LenProperties
+  <1>1. \A i \in 1..Len(s) : s[i] \in Ops(s)
+    BY <1>0 DEF Ops, SI!Range
+  <1>2. s = [i \in 1..Len(s) |-> s[i]]
+    BY <1>0
+  <1>3. [i \in 1..Len(s) |-> s[i]] \in Seq(Ops(s))
+    BY <1>0, <1>1, IsASeq
+  <1> QED
+    BY <1>2, <1>3
 
 LEMMA RangeAppend ==
-  ASSUME NEW S, NEW h \in Seq(S), NEW x
-  PROVE  Range(Append(h, x)) = Range(h) \cup {x}
-<1>1. h \in Seq(S \cup {x})
-  BY SeqMonotonic
-<1>2. Append(h, x) \in Seq(S \cup {x})
-  BY <1>1, AppendProperties
-<1>. QED
-  BY <1>1, <1>2, AppendProperties
+    ASSUME NEW S, NEW s \in Seq(S), NEW e
+    PROVE  /\ Ops(Append(s, e)) = Ops(s) \cup {e}
+           /\ Append(s, e) \in Seq(S \cup {e})
+  <1>1. s \in Seq(S \cup {e})
+    BY SeqDef
+  <1>2. Append(s, e) \in Seq(S \cup {e}) /\ Len(Append(s, e)) = Len(s) + 1
+    BY <1>1, AppendProperties
+  <1>3. \A i \in 1..Len(s) : Append(s, e)[i] = s[i]
+    BY <1>1, AppendProperties
+  <1>4. Append(s, e)[Len(s)+1] = e
+    BY <1>1, AppendProperties
+  <1>5. DOMAIN Append(s, e) = 1..Len(s)+1 /\ DOMAIN s = 1..Len(s)
+    BY <1>2, LenProperties
+  <1> QED
+    BY <1>2, <1>3, <1>4, <1>5 DEF Ops, SI!Range
 
-LEMMA RangeConcatPair ==
-  ASSUME NEW S, NEW h \in Seq(S), NEW a, NEW b
-  PROVE  Range(h \o <<a, b>>) = Range(h) \cup {a, b}
-<1>1. h \in Seq(S \cup {a, b})
-  BY SeqMonotonic
-<1>2. <<a, b>> \in Seq(S \cup {a, b})
-  BY PairSeq, SeqMonotonic
-<1>3. Range(<<a, b>>) = {a, b}
-  BY RangePair
-<1>. QED
-  BY <1>1, <1>2, <1>3, RangeConcatenation
+LEMMA RangeConcat2 ==
+    ASSUME NEW S, NEW s \in Seq(S), NEW a, NEW b
+    PROVE  /\ Ops(s \o <<a, b>>) = Ops(s) \cup {a, b}
+           /\ s \o <<a, b>> \in Seq(S \cup {a, b})
+  <1>1. s \in Seq(S \cup {a, b}) /\ <<a, b>> \in Seq(S \cup {a, b})
+    BY SeqDef
+  <1>2. /\ s \o <<a, b>> \in Seq(S \cup {a, b})
+        /\ Len(s \o <<a, b>>) = Len(s) + 2
+        /\ \A i \in 1 .. Len(s) + 2 :
+              (s \o <<a, b>>)[i] = IF i =< Len(s) THEN s[i] ELSE <<a, b>>[i - Len(s)]
+    BY <1>1, ConcatProperties
+  <1>5. DOMAIN (s \o <<a, b>>) = 1..Len(s)+2 /\ DOMAIN s = 1..Len(s)
+    BY <1>2, LenProperties
+  <1>6. Len(s) \in Nat
+    BY LenProperties
+  <1> QED
+    BY <1>2, <1>5, <1>6 DEF Ops, SI!Range
 
-LEMMA NewConcatIndex ==
-  ASSUME NEW S, NEW h \in Seq(S), NEW a, NEW b, NEW hp,
-         hp = h \o <<a, b>>,
-         hp \in Seq(S \cup {a, b}),
-         NEW i \in DOMAIN hp,
-         i \notin DOMAIN h
-  PROVE  i = Len(h) + 1 \/ i = Len(h) + 2
-<1>1. <<a, b>> \in Seq(S \cup {a, b})
-  BY PairSeq, SeqMonotonic
-<1>2. h \in Seq(S \cup {a, b})
-  BY SeqMonotonic
-<1>3. DOMAIN (h \o <<a, b>>) = 1..(Len(h) + 2)
-  BY <1>1, <1>2, ConcatProperties, LenProperties
-<1>4. DOMAIN hp = 1..(Len(h) + 2)
-  BY <1>3
-<1>5. DOMAIN h = 1..Len(h)
-  BY LenProperties
-<1>6. Len(h) \in Nat
-  BY LenProperties
-<1>7. i \in 1..(Len(h) + 2)
-  BY <1>4
-<1>8. i \notin 1..Len(h)
-  BY <1>5
-<1>. QED
-  BY <1>6, <1>7, <1>8
+UniqueOps(h) ==
+    \A op1, op2 \in Ops(h) : op1.txnId = op2.txnId /\ op1.type = op2.type => op1 = op2
 
-LEMMA WritesUnchangedNonBody ==
-  ASSUME NEW S, NEW h \in Seq(S), NEW x, x.type # "body"
-  PROVE  \A t, k : SI!WritesKey(Append(h, x), t, k) <=> SI!WritesKey(h, t, k)
-<1>1. Range(Append(h, x)) = Range(h) \cup {x}
-  BY RangeAppend
-<1>2. \A op \in Range(Append(h, x)) : op.type = "body" <=> op \in Range(h) /\ op.type = "body"
-  BY <1>1
-<1>. QED
-  BY <1>1, <1>2, RangeEq DEF SI!WritesKey
+BodyMatch(h, P) ==
+    \A op \in Ops(h) : op.type = "body" => op.reads = P[op.txnId].reads /\ op.writes = P[op.txnId].writes
 
-LEMMA ReadsUnchangedNonBody ==
-  ASSUME NEW S, NEW h \in Seq(S), NEW x, x.type # "body"
-  PROVE  \A t, k : SI!ReadsKey(Append(h, x), t, k) <=> SI!ReadsKey(h, t, k)
-<1>1. Range(Append(h, x)) = Range(h) \cup {x}
-  BY RangeAppend
-<1>2. \A op \in Range(Append(h, x)) : op.type = "body" <=> op \in Range(h) /\ op.type = "body"
-  BY <1>1
-<1>. QED
-  BY <1>1, <1>2, RangeEq DEF SI!ReadsKey
+LEMMA BTVal ==
+    ASSUME NEW h, UniqueOps(h), NEW t, NEW b \in Ops(h), b.type = "begin", b.txnId = t
+    PROVE  SI!BeginOp(h, t) = b /\ BT(h, t) = b.time
+  BY DEF UniqueOps, BT, SI!BeginOp, Ops
 
-LEMMA KeysWrittenUnchangedNonBody ==
-  ASSUME NEW S, NEW h \in Seq(S), NEW x, x.type # "body"
-  PROVE  \A t : SI!KeysWrittenByTxn(Append(h, x), t) = SI!KeysWrittenByTxn(h, t)
-BY WritesUnchangedNonBody DEF SI!KeysWrittenByTxn
+LEMMA CTVal ==
+    ASSUME NEW h, UniqueOps(h), NEW t, NEW c \in Ops(h), c.type = "commit", c.txnId = t
+    PROVE  SI!CommitOp(h, t) = c /\ CT(h, t) = c.time
+  BY DEF UniqueOps, CT, SI!CommitOp, Ops
 
-LEMMA KeysReadUnchangedNonBody ==
-  ASSUME NEW S, NEW h \in Seq(S), NEW x, x.type # "body"
-  PROVE  \A t : SI!KeysReadByTxn(Append(h, x), t) = SI!KeysReadByTxn(h, t)
-BY ReadsUnchangedNonBody DEF SI!KeysReadByTxn
+LEMMA HistKeys ==
+    ASSUME NEW h, NEW P, BodyMatch(h, P), NEW t, NEW bo \in Ops(h), bo.type = "body", bo.txnId = t
+    PROVE  /\ SI!KeysWrittenByTxn(h, t) = KW(P, t)
+           /\ \A k : SI!ReadsKey(h, t, k) <=> k \in P[t].reads
+           /\ \A k : SI!WritesKey(h, t, k) <=> \E wop \in P[t].writes : wop.key = k
+  <1>1. \A k : SI!ReadsKey(h, t, k) <=> k \in P[t].reads
+    BY DEF BodyMatch, SI!ReadsKey, Ops
+  <1>2. \A k : SI!WritesKey(h, t, k) <=> \E wop \in P[t].writes : wop.key = k
+    BY DEF BodyMatch, SI!WritesKey, Ops
+  <1> QED
+    BY <1>1, <1>2 DEF SI!KeysWrittenByTxn, KW, KWB
 
-LEMMA CommittedAppendCommit ==
-  ASSUME NEW S, NEW h \in Seq(S), NEW x, x.type = "commit"
-  PROVE  SI!CommittedTxns(Append(h, x)) = SI!CommittedTxns(h) \cup {x.txnId}
-<1>1. Range(Append(h, x)) = Range(h) \cup {x}
-  BY RangeAppend
-<1>. QED
-  BY <1>1, RangeEq DEF SI!CommittedTxns
+(***************************************************************************)
+(* A graph in which every edge strictly increases an integer potential has *)
+(* no cycle.                                                               *)
+(***************************************************************************)
+LEMMA NoCycle ==
+    ASSUME NEW E, NEW F(_),
+           \A e \in E : F(e[1]) \in Int /\ F(e[2]) \in Int /\ F(e[1]) < F(e[2])
+    PROVE  ~SI!IsCycleViaPath(E)
+  <1> SUFFICES ASSUME NEW p \in SI!Paths(E), Len(p) > 1, p[1] = p[Len(p)]
+               PROVE  FALSE
+    BY DEF SI!IsCycleViaPath
+  <1>1. PICK n \in 1..SI!PathBound(E) : p \in [1..n -> SI!GraphNodes(E)]
+    BY DEF SI!Paths
+  <1>2. Len(p) = n /\ n \in Nat
+    BY <1>1
+  <1>3. \A i \in 1..(n-1) : <<p[i], p[i+1]>> \in E
+    BY <1>1, <1>2 DEF SI!Paths
+  <1>4. \A i \in 1..(n-1) : F(p[i]) \in Int /\ F(p[i+1]) \in Int /\ F(p[i]) < F(p[i+1])
+    BY <1>3
+  <1> DEFINE Q(j) == j \in 2..n => F(p[1]) < F(p[j])
+  <1>5. \A j \in Nat : Q(j)
+    <2>1. Q(0)
+      OBVIOUS
+    <2>2. ASSUME NEW j \in Nat, Q(j) PROVE Q(j+1)
+      <3> SUFFICES ASSUME j + 1 \in 2..n PROVE F(p[1]) < F(p[j+1])
+        OBVIOUS
+      <3>1. CASE j = 1
+        BY <3>1, <1>4
+      <3>2. CASE j # 1
+        <4>1. j \in 2..n /\ j \in 1..(n-1)
+          BY <3>2
+        <4> QED
+          BY <4>1, <2>2, <1>4, <1>1
+      <3> QED
+        BY <3>1, <3>2
+    <2> QED
+      BY <2>1, <2>2, NatInduction
+  <1>6. n \in 2..n
+    BY <1>2
+  <1> QED
+    BY <1>5, <1>6, <1>2, <1>4
 
-LEMMA CommittedAppendNonCommit ==
-  ASSUME NEW S, NEW h \in Seq(S), NEW x, x.type # "commit"
-  PROVE  SI!CommittedTxns(Append(h, x)) = SI!CommittedTxns(h)
-<1>1. Range(Append(h, x)) = Range(h) \cup {x}
-  BY RangeAppend
-<1>. QED
-  BY <1>1, RangeEq DEF SI!CommittedTxns
+(***************************************************************************)
+(* The TPC-C programs under column granularity.                            *)
+(***************************************************************************)
 
-LEMMA CommittedConcatPairNonCommit ==
-  ASSUME NEW S, NEW h \in Seq(S), NEW a, NEW b,
-         a.type # "commit", b.type # "commit"
-  PROVE  SI!CommittedTxns(h \o <<a, b>>) = SI!CommittedTxns(h)
-<1>1. Range(h \o <<a, b>>) = Range(h) \cup {a, b}
-  BY RangeConcatPair
-<1>. QED
-  BY <1>1, RangeEq DEF SI!CommittedTxns
+LEMMA ReqTypes ==
+    ASSUME NEW req \in Requests
+    PROVE  /\ req.type \in AllTxnTypes
+           /\ req.type = "NewOrder" =>
+                req \in [type : {"NewOrder"}, w : WIds, d : DIds, c : CIds, sw : WIds, items : NewOrderItemSets]
+           /\ req.type = "Payment" =>
+                req \in [type : {"Payment"}, w : WIds, d : DIds, cw : WIds, cd : DIds, c : CIds]
+           /\ req.type = "OrderStatus" =>
+                req \in [type : {"OrderStatus"}, w : WIds, d : DIds, c : CIds]
+           /\ req.type = "Delivery" => req \in [type : {"Delivery"}, w : WIds]
+           /\ req.type = "StockLevel" => req \in [type : {"StockLevel"}, w : WIds, d : DIds]
+  BY DEF Requests, AllTxnTypes
 
-LEMMA WritesUnchangedConcatOther ==
-  ASSUME NEW S, NEW h \in Seq(S), NEW a, NEW b,
-         NEW t, a.txnId # t, b.txnId # t
-  PROVE  \A k : SI!WritesKey(h \o <<a, b>>, t, k) <=> SI!WritesKey(h, t, k)
-<1>1. Range(h \o <<a, b>>) = Range(h) \cup {a, b}
-  BY RangeConcatPair
-<1>2. \A op \in Range(h \o <<a, b>>) : op.txnId = t <=> op \in Range(h) /\ op.txnId = t
-  BY <1>1
-<1>. QED
-  BY <1>1, <1>2, RangeEq DEF SI!WritesKey
+LEMMA RdKeysCG ==
+    \A b, cols : RdKeys(b, cols) = {Item(b, c) : c \in cols}
+  BY CGAssm DEF RdKeys
 
-LEMMA KeysWrittenUnchangedConcatOther ==
-  ASSUME NEW S, NEW h \in Seq(S), NEW a, NEW b,
-         NEW t, a.txnId # t, b.txnId # t
-  PROVE  SI!KeysWrittenByTxn(h \o <<a, b>>, t) = SI!KeysWrittenByTxn(h, t)
-BY WritesUnchangedConcatOther DEF SI!KeysWrittenByTxn
+LEMMA WrOpsCG ==
+    \A snap, b, upd :
+        WrOps(snap, b, upd) = {[type |-> "write", key |-> Item(b, c), val |-> upd[c]] : c \in DOMAIN upd}
+  BY CGAssm DEF WrOps
 
------------------------------------------------------------------------------
-(*****************************************************************************)
-(* 6.  Inductive invariant                                                   *)
-(*****************************************************************************)
+LEMMA ColValCG ==
+    \A snap, b, c : ColVal(snap, b, c) = snap[Item(b, c)]
+  BY CGAssm DEF ColVal
 
-HistSeq == \E S : txnHistory \in Seq(S)
+LEMMA NOProg ==
+    ASSUME NEW req \in Requests, req.type = "NewOrder", NEW snap,
+           snap[NK(req.w, req.d)] \in OIds
+    PROVE  LET B == NewOrderProgram(req, snap) IN
+           /\ Static(req, B)
+           /\ DelDyn(req, B, snap)
+           /\ NOStatic(req, B, snap[NK(req.w, req.d)])
+  <1> DEFINE w == req.w  d == req.d  c == req.c  sw == req.sw  items == req.items
+             o == snap[NK(w, d)]
+             B == NewOrderProgram(req, snap)
+  <1>0. req \in [type : {"NewOrder"}, w : WIds, d : DIds, c : CIds, sw : WIds, items : NewOrderItemSets]
+    BY ReqTypes
+  <1>1. B.reads = {Item(WhKey(w), "tax"), Item(DistKey(w, d), "tax"), Item(DistKey(w, d), "nextoid"),
+                   Item(CustKey(w, d, c), "info")}
+                  \cup {Item(ItemKey(i), "info") : i \in items}
+                  \cup {Item(StockKey(sw, i), "qty") : i \in items}
+    BY RdKeysCG, ColValCG DEF NewOrderProgram
+  <1>2. B.writes = {[type |-> "write", key |-> NK(w, d), val |-> o + 1],
+                    [type |-> "write", key |-> Item(OrderKey(w, d, o), "hdr"), val |-> c],
+                    [type |-> "write", key |-> Item(OrderKey(w, d, o), "carrier"), val |-> Tag],
+                    [type |-> "write", key |-> Item(NewOrdKey(w, d, o), "row"), val |-> Tag],
+                    [type |-> "write", key |-> Item(OrdLineKey(w, d, o), "items"), val |-> items],
+                    [type |-> "write", key |-> Item(OrdLineKey(w, d, o), "delivery"), val |-> Tag]}
+                   \cup {[type |-> "write", key |-> Item(StockKey(sw, i), "qty"), val |-> Tag] : i \in items}
+    BY WrOpsCG, ColValCG DEF NewOrderProgram, NK
+  <1>a. w \in WIds /\ d \in DIds /\ o \in OIds
+    BY <1>0
+  <1>b. NK(w, d) \in Keys
+    BY <1>a, NKInKeys
+  <1>3. Static(req, B)
+    <2>1. \A k \in RNWB(B) : k.col \in {"tax", "info"}
+      <3> SUFFICES ASSUME NEW k \in RNWB(B) PROVE k.col \in {"tax", "info"}
+        OBVIOUS
+      <3>1. k \in B.reads /\ k \in Keys /\ k \notin KWB(B)
+        BY DEF RNWB
+      <3>2. k # NK(w, d)
+        BY <3>1, <1>2 DEF KWB
+      <3>3. \A i \in items : k # Item(StockKey(sw, i), "qty")
+        BY <3>1, <1>2 DEF KWB
+      <3> QED
+        BY <3>1, <3>2, <3>3, <1>1, KeyFields DEF NK
+    <2>2. \A wop \in B.writes : wop.key.col \notin {"tax", "info"}
+      BY <1>2, KeyFields, NKFields
+    <2> QED
+      BY <2>1, <2>2 DEF Static, UpdTypes
+  <1>4. DelDyn(req, B, snap)
+    BY DEF DelDyn
+  <1>5. NOStatic(req, B, o)
+    <2>1. NK(w, d) \in KWB(B)
+      BY <1>2, <1>b DEF KWB
+    <2>2. \A wop \in B.writes :
+             (wop.key.tbl = "DIST" /\ wop.key.col = "nextoid") => wop.key = NK(w, d) /\ wop.val = o + 1
+      BY <1>2, KeyFields
+    <2>3. \A wop \in B.writes :
+             wop.key.tbl \in {"ORDER", "ORDERLINE", "NEWORDER"} => wop.key.w = w /\ wop.key.d = d /\ wop.key.o = o
+      BY <1>2, KeyFields, NKFields
+    <2> QED
+      BY <2>1, <2>2, <2>3 DEF NOStatic
+  <1> QED
+    BY <1>3, <1>4, <1>5
 
-ClockType == clock \in Nat
+LEMMA PayProg ==
+    ASSUME NEW tid, NEW req \in Requests, req.type = "Payment", NEW snap
+    PROVE  LET B == PaymentProgram(tid, req, snap) IN
+           Static(req, B) /\ DelDyn(req, B, snap)
+  <1> DEFINE w == req.w  d == req.d  cw == req.cw  cd == req.cd  c == req.c
+             B == PaymentProgram(tid, req, snap)
+  <1>1. B.reads = {Item(WhKey(w), "ytd"), Item(DistKey(w, d), "ytd"), Item(CustKey(cw, cd, c), "balance")}
+    BY RdKeysCG DEF PaymentProgram
+  <1>2. B.writes = {[type |-> "write", key |-> Item(WhKey(w), "ytd"), val |-> Tag],
+                    [type |-> "write", key |-> Item(DistKey(w, d), "ytd"), val |-> Tag],
+                    [type |-> "write", key |-> Item(CustKey(cw, cd, c), "balance"), val |-> Tag],
+                    [type |-> "write", key |-> Item(HistKey(tid), "row"), val |-> Tag]}
+    BY WrOpsCG DEF PaymentProgram
+  <1>3. RNWB(B) = {}
+    BY <1>1, <1>2 DEF RNWB, KWB
+  <1>4. \A wop \in B.writes :
+           /\ wop.key.col \notin {"tax", "info"}
+           /\ ~(wop.key.tbl = "DIST" /\ wop.key.col = "nextoid")
+           /\ ~(wop.key.tbl \in {"ORDER", "ORDERLINE"} /\ wop.key.col \in {"hdr", "items"})
+           /\ wop.key.tbl # "NEWORDER"
+    BY <1>2, KeyFields
+  <1> QED
+    BY <1>3, <1>4 DEF Static, DelDyn, UpdTypes
 
-OpShape ==
-  \A op \in Range(txnHistory) :
-    /\ "type" \in DOMAIN op
-    /\ "txnId" \in DOMAIN op
-    /\ op.txnId \in TxnIds
-    /\ op.type \in {"begin", "body", "commit", "abort"}
-    /\ op.type \in {"begin", "commit", "abort"} =>
-         "time" \in DOMAIN op /\ op.time \in Nat
-    /\ op.type = "body" =>
-         /\ "reads" \in DOMAIN op
-         /\ "writes" \in DOMAIN op
-         /\ \A w \in op.writes : "key" \in DOMAIN w
-    /\ op.type = "commit" =>
-         "updatedKeys" \in DOMAIN op
+LEMMA OSProg ==
+    ASSUME NEW req \in Requests, req.type = "OrderStatus", NEW snap
+    PROVE  LET B == OrderStatusProgram(req, snap) IN
+           Static(req, B) /\ DelDyn(req, B, snap)
+  <1>1. OrderStatusProgram(req, snap).writes = {}
+    BY DEF OrderStatusProgram
+  <1> QED
+    BY <1>1 DEF Static, DelDyn, UpdTypes
 
-UniqueOps ==
-  \A i, j \in DOMAIN txnHistory :
-    txnHistory[i].type = txnHistory[j].type /\ txnHistory[i].txnId = txnHistory[j].txnId
-      => i = j
+LEMMA SLProg ==
+    ASSUME NEW req \in Requests, req.type = "StockLevel", NEW snap
+    PROVE  LET B == StockLevelProgram(req, snap) IN
+           Static(req, B) /\ DelDyn(req, B, snap)
+  <1>1. StockLevelProgram(req, snap).writes = {}
+    BY DEF StockLevelProgram
+  <1> QED
+    BY <1>1 DEF Static, DelDyn, UpdTypes
 
-TimesMono ==
-  \A i, j \in DOMAIN txnHistory :
-    /\ i < j
-    /\ txnHistory[i].type \in {"begin", "commit", "abort"}
-    /\ txnHistory[j].type \in {"begin", "commit", "abort"}
-    => txnHistory[i].time < txnHistory[j].time
+LEMMA MinProps ==
+    ASSUME NEW U \in SUBSET Nat, U # {}
+    PROVE  Min(U) \in U /\ \A y \in U : Min(U) =< y
+  <1> DEFINE P(m) == m \in U
+  <1>1. PICK n \in U : TRUE
+    OBVIOUS
+  <1>1a. n \in Nat /\ P(n)
+    BY <1>1
+  <1> HIDE DEF P
+  <1>2. \E m \in Nat : P(m) /\ \A k \in 0 .. m-1 : ~P(k)
+    BY ONLY <1>1a, SmallestNatural, Isa
+  <1> USE DEF P
+  <1>3. PICK m \in Nat : P(m) /\ \A k \in 0 .. m-1 : ~P(k)
+    BY <1>2
+  <1>4. \A y \in U : m =< y
+    <2> SUFFICES ASSUME NEW y \in U PROVE m =< y
+      OBVIOUS
+    <2>1. y \in Nat
+      OBVIOUS
+    <2>2. ~(y \in 0 .. m-1)
+      BY <1>3
+    <2> QED
+      BY <2>1, <2>2, <1>3
+  <1>5. \E mm \in U : \A y \in U : mm =< y
+    BY <1>3, <1>4
+  <1> QED
+    BY <1>5 DEF Min
 
-TimesVsClock ==
-  \A op \in Range(txnHistory) :
-    op.type \in {"begin", "commit", "abort"} => op.time <= clock
+LEMMA DFDFacts ==
+    ASSUME NEW w \in WIds, NEW d \in DIds, NEW snap, DataInvS(snap)
+    PROVE  LET D == DeliveryForDistrict(w, d, snap) IN
+           /\ \A wop \in D.writes :
+                 /\ wop.key.col \in {"row", "carrier", "delivery", "balance"}
+                 /\ wop.key.tbl \in {"NEWORDER", "ORDER", "ORDERLINE", "CUST"}
+                 /\ wop.key.tbl = "NEWORDER" => wop.val = Empty
+                 /\ ~(wop.key.tbl \in {"ORDER", "ORDERLINE"} /\ wop.key.col \in {"hdr", "items"})
+           /\ \A k \in D.reads :
+                 \/ \E wop \in D.writes : wop.key = k
+                 \/ /\ k.tbl \in {"ORDER", "ORDERLINE"} /\ k.col \in {"hdr", "items"}
+                    /\ k.w = w /\ k.d = d /\ k.o \in OIds /\ k.o < snap[NK(w, d)]
+  <1> DEFINE U == {o \in OIds : RowExists(snap, NewOrdKey(w, d, o))}
+             D == DeliveryForDistrict(w, d, snap)
+  <1>1. CASE U = {}
+    <2>1. D.reads = {} /\ D.writes = {}
+      BY <1>1 DEF DeliveryForDistrict
+    <2> QED
+      BY <2>1
+  <1>2. CASE U # {}
+    <2> DEFINE o == Min(U)
+               cust == ColVal(snap, OrderKey(w, d, o), "hdr")
+    <2>0. U \subseteq Nat
+      BY DEF OIds
+    <2>1. o \in U
+      BY <1>2, <2>0, MinProps
+    <2>2. o \in OIds /\ snap[NOK(w, d, o)] # Empty
+      <3>1. o \in OIds /\ RowExists(snap, NewOrdKey(w, d, o))
+        BY <2>1
+      <3>2. PrimaryCol(NewOrdKey(w, d, o).tbl) = "row"
+        BY DEF PrimaryCol, NewOrdKey
+      <3>3. RowExists(snap, NewOrdKey(w, d, o)) <=> snap[Item(NewOrdKey(w, d, o), "row")] # Empty
+        BY <3>2, ColValCG DEF RowExists
+      <3> QED
+        BY <3>1, <3>3 DEF NOK
+    <2>3. o < snap[NK(w, d)]
+      BY <2>2 DEF DataInvS
+    <2>4. D.reads = {Item(NewOrdKey(w, d, o), "row"), Item(OrderKey(w, d, o), "hdr"),
+                     Item(OrdLineKey(w, d, o), "items"), Item(CustKey(w, d, cust), "balance")}
+      BY <1>2, RdKeysCG DEF DeliveryForDistrict
+    <2>5. D.writes = {[type |-> "write", key |-> Item(NewOrdKey(w, d, o), "row"), val |-> Empty],
+                      [type |-> "write", key |-> Item(OrderKey(w, d, o), "carrier"), val |-> Tag],
+                      [type |-> "write", key |-> Item(OrdLineKey(w, d, o), "delivery"), val |-> Tag],
+                      [type |-> "write", key |-> Item(CustKey(w, d, cust), "balance"), val |-> Tag]}
+      <3>1. DelOps(NewOrdKey(w, d, o)) = {[type |-> "write", key |-> Item(NewOrdKey(w, d, o), "row"), val |-> Empty]}
+        BY CGAssm DEF DelOps, ColsOf, NewOrdKey
+      <3> QED
+        BY <1>2, <3>1, WrOpsCG DEF DeliveryForDistrict
+    <2>6. \A wop \in D.writes :
+                 /\ wop.key.col \in {"row", "carrier", "delivery", "balance"}
+                 /\ wop.key.tbl \in {"NEWORDER", "ORDER", "ORDERLINE", "CUST"}
+                 /\ wop.key.tbl = "NEWORDER" => wop.val = Empty
+                 /\ ~(wop.key.tbl \in {"ORDER", "ORDERLINE"} /\ wop.key.col \in {"hdr", "items"})
+      BY <2>5, KeyFields
+    <2>7. \A k \in D.reads :
+                 \/ \E wop \in D.writes : wop.key = k
+                 \/ /\ k.tbl \in {"ORDER", "ORDERLINE"} /\ k.col \in {"hdr", "items"}
+                    /\ k.w = w /\ k.d = d /\ k.o \in OIds /\ k.o < snap[NK(w, d)]
+      BY <2>2, <2>3, <2>4, <2>5, KeyFields
+    <2> QED
+      BY <2>6, <2>7
+  <1> QED
+    BY <1>1, <1>2
 
-OrderOK ==
-  /\ \A i, j \in DOMAIN txnHistory :
-        txnHistory[i].txnId = txnHistory[j].txnId
-        /\ txnHistory[i].type = "begin"
-        /\ txnHistory[j].type \in {"body", "commit", "abort"}
-        => i < j
-  /\ \A i, j \in DOMAIN txnHistory :
-        txnHistory[i].txnId = txnHistory[j].txnId
-        /\ txnHistory[i].type = "body"
-        /\ txnHistory[j].type \in {"commit", "abort"}
-        => i < j
+LEMMA DelProg ==
+    ASSUME NEW req \in Requests, req.type = "Delivery", NEW snap, DataInvS(snap)
+    PROVE  LET B == DeliveryProgram(req, snap) IN
+           Static(req, B) /\ DelDyn(req, B, snap)
+  <1> DEFINE w == req.w
+             B == DeliveryProgram(req, snap)
+  <1>0. w \in WIds
+    BY ReqTypes
+  <1>1. B.reads = UNION {DeliveryForDistrict(w, d, snap).reads : d \in DIds}
+        /\ B.writes = UNION {DeliveryForDistrict(w, d, snap).writes : d \in DIds}
+    BY DEF DeliveryProgram
+  <1>2. \A wop \in B.writes :
+           /\ wop.key.col \notin {"tax", "info"}
+           /\ ~(wop.key.tbl = "DIST" /\ wop.key.col = "nextoid")
+           /\ ~(wop.key.tbl \in {"ORDER", "ORDERLINE"} /\ wop.key.col \in {"hdr", "items"})
+           /\ wop.key.tbl = "NEWORDER" => wop.val = Empty
+    <2> SUFFICES ASSUME NEW wop \in B.writes
+                 PROVE  /\ wop.key.col \notin {"tax", "info"}
+                        /\ ~(wop.key.tbl = "DIST" /\ wop.key.col = "nextoid")
+                        /\ ~(wop.key.tbl \in {"ORDER", "ORDERLINE"} /\ wop.key.col \in {"hdr", "items"})
+                        /\ wop.key.tbl = "NEWORDER" => wop.val = Empty
+      OBVIOUS
+    <2>1. PICK d \in DIds : wop \in DeliveryForDistrict(w, d, snap).writes
+      BY <1>1
+    <2> QED
+      BY <2>1, <1>0, DFDFacts
+  <1>3. \A k \in RNWB(B) : /\ k.tbl \in {"ORDER", "ORDERLINE"}
+                           /\ k.col \in {"hdr", "items"}
+                           /\ k.w \in WIds /\ k.d \in DIds /\ k.o \in OIds
+                           /\ k.o < snap[NK(k.w, k.d)]
+    <2> SUFFICES ASSUME NEW k \in RNWB(B)
+                 PROVE  /\ k.tbl \in {"ORDER", "ORDERLINE"}
+                        /\ k.col \in {"hdr", "items"}
+                        /\ k.w \in WIds /\ k.d \in DIds /\ k.o \in OIds
+                        /\ k.o < snap[NK(k.w, k.d)]
+      OBVIOUS
+    <2>1. k \in B.reads /\ k \in Keys /\ k \notin KWB(B)
+      BY DEF RNWB
+    <2>2. PICK d \in DIds : k \in DeliveryForDistrict(w, d, snap).reads
+      BY <2>1, <1>1
+    <2>3. ~\E wop \in DeliveryForDistrict(w, d, snap).writes : wop.key = k
+      BY <2>1, <1>1 DEF KWB
+    <2> QED
+      BY <2>2, <2>3, <1>0, DFDFacts
+  <1> QED
+    BY <1>2, <1>3 DEF Static, DelDyn, UpdTypes
 
-CommitHasPreds ==
-  \A c \in Range(txnHistory) :
-    c.type = "commit" =>
-      /\ \E b \in Range(txnHistory) : b.type = "begin" /\ b.txnId = c.txnId
-      /\ \E d \in Range(txnHistory) : d.type = "body"  /\ d.txnId = c.txnId
+LEMMA ProgFor ==
+    ASSUME NEW tid, NEW req \in Requests, NEW snap, DataInvS(snap), ReqEnabled(req, snap)
+    PROVE  LET B == ProgramFor(tid, req, snap) IN
+           /\ Static(req, B)
+           /\ DelDyn(req, B, snap)
+           /\ req.type = "NewOrder" =>
+                 /\ snap[NK(req.w, req.d)] \in OIds
+                 /\ NOStatic(req, B, snap[NK(req.w, req.d)])
+  <1>0. req.type \in AllTxnTypes
+    BY ReqTypes
+  <1>1. CASE req.type = "NewOrder"
+    <2>1. snap[NK(req.w, req.d)] \in OIds
+      BY <1>1, ColValCG DEF ReqEnabled, NewOrderEnabled, NK
+    <2>2. ProgramFor(tid, req, snap) = NewOrderProgram(req, snap)
+      BY <1>1 DEF ProgramFor
+    <2> QED
+      BY <1>1, <2>1, <2>2, NOProg
+  <1>2. CASE req.type = "Payment"
+    <2>2. ProgramFor(tid, req, snap) = PaymentProgram(tid, req, snap)
+      BY <1>2 DEF ProgramFor
+    <2> QED
+      BY <1>2, <2>2, PayProg
+  <1>3. CASE req.type = "OrderStatus"
+    <2>2. ProgramFor(tid, req, snap) = OrderStatusProgram(req, snap)
+      BY <1>3 DEF ProgramFor
+    <2> QED
+      BY <1>3, <2>2, OSProg
+  <1>4. CASE req.type = "Delivery"
+    <2>2. ProgramFor(tid, req, snap) = DeliveryProgram(req, snap)
+      BY <1>4 DEF ProgramFor
+    <2> QED
+      BY <1>4, <2>2, DelProg
+  <1>5. CASE req.type = "StockLevel"
+    <2>2. ProgramFor(tid, req, snap) = StockLevelProgram(req, snap)
+      BY <1>5 DEF ProgramFor
+    <2> QED
+      BY <1>5, <2>2, SLProg
+  <1> QED
+    BY <1>0, <1>1, <1>2, <1>3, <1>4, <1>5 DEF AllTxnTypes
 
-AbortHasPreds ==
-  \A a \in Range(txnHistory) :
-    a.type = "abort" =>
-      /\ \E b \in Range(txnHistory) : b.type = "begin" /\ b.txnId = a.txnId
-      /\ \E d \in Range(txnHistory) : d.type = "body"  /\ d.txnId = a.txnId
+----------------------------------------------------------------------------
+(***************************************************************************)
+(* The initial state.                                                      *)
+(***************************************************************************)
 
-H1inv ==
-  \A b, c \in Range(txnHistory) :
-    b.type = "begin" /\ c.type = "commit" /\ b.txnId = c.txnId => b.time < c.time
+LEMMA InitStoreFacts ==
+    ASSUME Init
+    PROVE  DataInv
+  <1>1. \A w \in WIds, d \in DIds : dataStore[NK(w, d)] = InitOrders + 1
+    <2> SUFFICES ASSUME NEW w \in WIds, NEW d \in DIds PROVE dataStore[NK(w, d)] = InitOrders + 1
+      OBVIOUS
+    <2>1. NK(w, d) \in Keys
+      BY NKInKeys
+    <2> DEFINE k == NK(w, d)
+               base == [f \in (DOMAIN k) \ {"col"} |-> k[f]]
+    <2>2. "tbl" \in (DOMAIN k) \ {"col"} /\ k["tbl"] = "DIST" /\ k.col = "nextoid"
+      BY CGAssm DEF NK, Item, DistKey
+    <2>3. base.tbl = "DIST"
+      BY <2>2
+    <2>4. InitRow(base) = [tax |-> Tag, ytd |-> Tag, nextoid |-> InitOrders + 1]
+      BY <2>3 DEF InitRow
+    <2>5. dataStore[k] = IF InitRow(base) = Empty THEN Empty ELSE InitRow(base)[k.col]
+      BY <2>1, CGAssm DEF Init, InitStore
+    <2> QED
+      BY <2>2, <2>4, <2>5, EmptyAssm
+  <1>2. \A w \in WIds, d \in DIds, o \in OIds : dataStore[NOK(w, d, o)] # Empty => o =< InitOrders
+    <2> SUFFICES ASSUME NEW w \in WIds, NEW d \in DIds, NEW o \in OIds,
+                        dataStore[NOK(w, d, o)] # Empty
+                 PROVE  o =< InitOrders
+      OBVIOUS
+    <2>1. NOK(w, d, o) \in Keys
+      BY NOKInKeys
+    <2> DEFINE k == NOK(w, d, o)
+               base == [f \in (DOMAIN k) \ {"col"} |-> k[f]]
+    <2>2. /\ "tbl" \in (DOMAIN k) \ {"col"} /\ k["tbl"] = "NEWORDER"
+          /\ "o" \in (DOMAIN k) \ {"col"} /\ k["o"] = o
+      BY CGAssm DEF NOK, Item, NewOrdKey
+    <2>3. base.tbl = "NEWORDER" /\ base.o = o
+      BY <2>2
+    <2>4. InitRow(base) = IF o =< InitOrders THEN [row |-> Tag] ELSE Empty
+      BY <2>3 DEF InitRow
+    <2>5. dataStore[k] = IF InitRow(base) = Empty THEN Empty ELSE InitRow(base)[k.col]
+      BY <2>1, CGAssm DEF Init, InitStore
+    <2> QED
+      BY <2>4, <2>5
+  <1>3. InitOrders \in Nat
+    BY InitOrdersAssm
+  <1> QED
+    BY <1>1, <1>2, <1>3 DEF DataInv, DataInvS, OIds
 
-H2inv ==
-  \A d \in Range(txnHistory) :
-    d.type = "body" => BodyH2(d)
+THEOREM InitInv ==
+    Init => Inv
+  <1> SUFFICES ASSUME Init PROVE Inv
+    OBVIOUS
+  <1>1. Ops(txnHistory) = {}
+    BY DEF Init, Ops, SI!Range
+  <1>2. TypeInv
+    <2>1. DOMAIN dataStore = Keys
+      BY CGAssm DEF Init, InitStore
+    <2>2. txnHistory \in Seq(Ops(txnHistory))
+      BY EmptySeq DEF Init
+    <2> QED
+      BY <2>1, <2>2 DEF Init, TypeInv
+  <1>3. HistInv
+    BY <1>1 DEF HistInv, Init, Started
+  <1>4. SnapInv /\ BodyInv
+    BY <1>1 DEF SnapInv, BodyInv, Started
+  <1>5. SafeInv
+    BY DEF SafeInv, Init, RunIds
+  <1>6. RWInv
+    BY <1>1 DEF RWInv, Committed
+  <1> QED
+    BY <1>2, <1>3, <1>4, <1>5, <1>6, InitStoreFacts DEF Inv
 
-NoWriteROinv == NoWriteRO(txnHistory)
+----------------------------------------------------------------------------
+(***************************************************************************)
+(* The invariant implies serializability.                                  *)
+(***************************************************************************)
 
-H3inv ==
-  \A c1, c2 \in Range(txnHistory) :
-    /\ c1.type = "commit" /\ c2.type = "commit"
-    /\ c1.txnId # c2.txnId
-    /\ SI!KeysWrittenByTxn(txnHistory, c1.txnId) \cap SI!KeysWrittenByTxn(txnHistory, c2.txnId) # {}
-    =>
-    \A b1, b2 \in Range(txnHistory) :
-      b1.type = "begin" /\ b1.txnId = c1.txnId /\
-      b2.type = "begin" /\ b2.txnId = c2.txnId
-      => c1.time < b2.time \/ c2.time < b1.time
+Pos(t) == IF KW(txnProg, t) # {} THEN CT(txnHistory, t) ELSE BT(txnHistory, t)
 
-CommitKeys ==
-  \A c \in Range(txnHistory) :
-    c.type = "commit" => c.updatedKeys = SI!KeysWrittenByTxn(txnHistory, c.txnId)
+LEMMA CommittedFacts ==
+    ASSUME TypeInv, HistInv, NEW t, Committed(txnHistory, t)
+    PROVE  /\ t \in TxnIds
+           /\ BT(txnHistory, t) \in Nat
+           /\ CT(txnHistory, t) \in Nat
+           /\ BT(txnHistory, t) < CT(txnHistory, t)
+           /\ CT(txnHistory, t) =< clock
+           /\ SI!KeysWrittenByTxn(txnHistory, t) = KW(txnProg, t)
+           /\ \A k : SI!ReadsKey(txnHistory, t, k) <=> k \in txnProg[t].reads
+           /\ \A k : SI!WritesKey(txnHistory, t, k) <=> \E wop \in txnProg[t].writes : wop.key = k
+  <1>1. PICK c \in Ops(txnHistory) : c.txnId = t /\ c.type = "commit"
+    BY DEF Committed
+  <1>2. t \in TxnIds /\ Started(txnHistory, t)
+    BY <1>1 DEF HistInv, Started
+  <1>3. PICK b \in Ops(txnHistory) : b.txnId = t /\ b.type = "begin"
+    BY <1>2 DEF HistInv
+  <1>4. PICK bo \in Ops(txnHistory) : bo.txnId = t /\ bo.type = "body"
+    BY <1>2 DEF HistInv
+  <1>5. UniqueOps(txnHistory) /\ BodyMatch(txnHistory, txnProg)
+    BY DEF HistInv, UniqueOps, BodyMatch
+  <1>6. BT(txnHistory, t) = b.time /\ CT(txnHistory, t) = c.time
+    BY <1>1, <1>3, <1>5, BTVal, CTVal
+  <1>7. b.time \in Nat /\ c.time \in Nat /\ c.time =< clock /\ BT(txnHistory, t) < c.time
+    BY <1>1, <1>3 DEF HistInv
+  <1> QED
+    BY <1>2, <1>4, <1>5, <1>6, <1>7, HistKeys
 
-RunningOK ==
-  /\ runningTxns \subseteq [id : TxnIds, startTime : Nat, commitTime : {Empty}]
-  /\ \A txn \in runningTxns :
-        /\ \E b \in Range(txnHistory) :
-              b.type = "begin" /\ b.txnId = txn.id /\ b.time = txn.startTime
-        /\ \E d \in Range(txnHistory) : d.type = "body" /\ d.txnId = txn.id
-        /\ ~\E c \in Range(txnHistory) : c.type \in {"commit", "abort"} /\ c.txnId = txn.id
-  /\ \A t1, t2 \in runningTxns : t1.id = t2.id => t1 = t2
+THEOREM InvSerializable ==
+    Inv => SerializableViaPath
+  <1> SUFFICES ASSUME Inv PROVE SerializableViaPath
+    OBVIOUS
+  <1> DEFINE E == SI!SerializationGraph(txnHistory)
+  <1>1. \A e \in E : Pos(e[1]) \in Int /\ Pos(e[2]) \in Int /\ Pos(e[1]) < Pos(e[2])
+    <2> SUFFICES ASSUME NEW e \in E
+                 PROVE  Pos(e[1]) \in Int /\ Pos(e[2]) \in Int /\ Pos(e[1]) < Pos(e[2])
+      OBVIOUS
+    <2> DEFINE t1 == e[1]  t2 == e[2]
+    <2>0. /\ e \in SI!CommittedTxns(txnHistory) \X SI!CommittedTxns(txnHistory)
+          /\ t1 # t2
+          /\ \/ SI!WWDependency(txnHistory, t1, t2)
+             \/ SI!WRDependency(txnHistory, t1, t2)
+             \/ SI!RWDependency(txnHistory, t1, t2)
+      BY DEF SI!SerializationGraph
+    <2>a. \A x \in SI!CommittedTxns(txnHistory) : Committed(txnHistory, x)
+      BY DEF SI!CommittedTxns, Committed, Ops
+    <2>1. /\ Committed(txnHistory, t1) /\ Committed(txnHistory, t2) /\ t1 # t2
+          /\ \/ SI!WWDependency(txnHistory, t1, t2)
+             \/ SI!WRDependency(txnHistory, t1, t2)
+             \/ SI!RWDependency(txnHistory, t1, t2)
+      BY <2>0, <2>a
+    <2>2. /\ t1 \in TxnIds /\ BT(txnHistory, t1) \in Nat /\ CT(txnHistory, t1) \in Nat
+          /\ BT(txnHistory, t1) < CT(txnHistory, t1)
+          /\ \A k : SI!ReadsKey(txnHistory, t1, k) <=> k \in txnProg[t1].reads
+          /\ \A k : SI!WritesKey(txnHistory, t1, k) <=> \E wop \in txnProg[t1].writes : wop.key = k
+      BY <2>1, CommittedFacts DEF Inv
+    <2>3. /\ t2 \in TxnIds /\ BT(txnHistory, t2) \in Nat /\ CT(txnHistory, t2) \in Nat
+          /\ BT(txnHistory, t2) < CT(txnHistory, t2)
+          /\ \A k : SI!ReadsKey(txnHistory, t2, k) <=> k \in txnProg[t2].reads
+          /\ \A k : SI!WritesKey(txnHistory, t2, k) <=> \E wop \in txnProg[t2].writes : wop.key = k
+      BY <2>1, CommittedFacts DEF Inv
+    <2>4. Pos(t1) \in Int /\ Pos(t2) \in Int
+      BY <2>2, <2>3 DEF Pos
+    <2>5. CASE SI!WWDependency(txnHistory, t1, t2)
+      <3>1. PICK k \in Keys : SI!WritesKey(txnHistory, t1, k) /\ SI!WritesKey(txnHistory, t2, k)
+        BY <2>5 DEF SI!WWDependency
+      <3>2. k \in KW(txnProg, t1) /\ k \in KW(txnProg, t2)
+        BY <3>1, <2>2, <2>3 DEF KW, KWB
+      <3>3. CT(txnHistory, t1) < CT(txnHistory, t2)
+        BY <2>5 DEF SI!WWDependency, CT
+      <3> QED
+        BY <3>2, <3>3, <2>4 DEF Pos
+    <2>6. CASE SI!WRDependency(txnHistory, t1, t2)
+      <3>1. PICK k \in Keys : SI!WritesKey(txnHistory, t1, k) /\ SI!ReadsKey(txnHistory, t2, k)
+        BY <2>6 DEF SI!WRDependency
+      <3>2. k \in KW(txnProg, t1)
+        BY <3>1, <2>2 DEF KW, KWB
+      <3>3. CT(txnHistory, t1) < BT(txnHistory, t2)
+        BY <2>6 DEF SI!WRDependency, CT, BT
+      <3> QED
+        BY <3>2, <3>3, <2>2, <2>3, <2>4 DEF Pos
+    <2>7. CASE SI!RWDependency(txnHistory, t1, t2)
+      <3>1. PICK k \in Keys : SI!ReadsKey(txnHistory, t1, k) /\ SI!WritesKey(txnHistory, t2, k)
+        BY <2>7 DEF SI!RWDependency
+      <3>2. k \in KW(txnProg, t2) /\ k \in txnProg[t1].reads
+        BY <3>1, <2>2, <2>3 DEF KW, KWB
+      <3>3. BT(txnHistory, t1) < CT(txnHistory, t2)
+        BY <2>7 DEF SI!RWDependency, CT, BT
+      <3>4. CASE KW(txnProg, t1) = {}
+        BY <3>2, <3>3, <3>4, <2>4 DEF Pos
+      <3>5. CASE KW(txnProg, t1) # {}
+        <4>1. CT(txnHistory, t1) < CT(txnHistory, t2)
+          BY <3>2, <3>3, <3>5, <2>1, <2>2, <2>3 DEF Inv, RWInv
+        <4> QED
+          BY <4>1, <3>2, <3>5, <2>4 DEF Pos
+      <3> QED
+        BY <3>4, <3>5
+    <2> QED
+      BY <2>1, <2>4, <2>5, <2>6, <2>7
+  <1>2. ~SI!IsCycleViaPath(E)
+    BY <1>1, NoCycle
+  <1> QED
+    BY <1>2 DEF SerializableViaPath, SI!SerializableViaPath, SI!IsConflictSerializableViaPath
 
-Inv ==
-  /\ HistSeq
-  /\ ClockType
-  /\ OpShape
-  /\ UniqueOps
-  /\ TimesMono
-  /\ TimesVsClock
-  /\ OrderOK
-  /\ CommitHasPreds
-  /\ AbortHasPreds
-  /\ H1inv
-  /\ H2inv
-  /\ NoWriteROinv
-  /\ H3inv
-  /\ CommitKeys
-  /\ RunningOK
+----------------------------------------------------------------------------
+(***************************************************************************)
+(* Lemmas used by all the step proofs.                                     *)
+(***************************************************************************)
 
------------------------------------------------------------------------------
-(*****************************************************************************)
-(* 7.  Inv implies HistFacts, hence serializability                          *)
-(*****************************************************************************)
+LEMMA StartedFacts ==
+    ASSUME TypeInv, HistInv, NEW t, Started(txnHistory, t)
+    PROVE  /\ t \in TxnIds
+           /\ \E b \in Ops(txnHistory) : b.txnId = t /\ b.type = "begin" /\ b.time = BT(txnHistory, t)
+           /\ BT(txnHistory, t) \in Nat
+           /\ BT(txnHistory, t) =< clock
+           /\ \E bo \in Ops(txnHistory) : bo.txnId = t /\ bo.type = "body"
+  <1>1. t \in TxnIds
+    BY DEF HistInv, Started
+  <1>2. PICK b \in Ops(txnHistory) : b.txnId = t /\ b.type = "begin"
+    BY <1>1 DEF HistInv
+  <1>3. UniqueOps(txnHistory)
+    BY DEF HistInv, UniqueOps
+  <1>4. BT(txnHistory, t) = b.time
+    BY <1>2, <1>3, BTVal
+  <1>5. b.time \in Nat /\ b.time =< clock
+    BY <1>2 DEF HistInv
+  <1> QED
+    BY <1>1, <1>2, <1>4, <1>5 DEF HistInv
 
-LEMMA UniqueOpsRangeBegin ==
-  ASSUME Inv
-  PROVE  UniqueBegin(txnHistory)
-<1> SUFFICES ASSUME NEW op1 \in Range(txnHistory), NEW op2 \in Range(txnHistory),
-                    op1.type = "begin", op2.type = "begin", op1.txnId = op2.txnId
-             PROVE  op1 = op2
-  BY DEF UniqueBegin
-<1>1. PICK i \in DOMAIN txnHistory : txnHistory[i] = op1
-  BY DEF Range
-<1>2. PICK j \in DOMAIN txnHistory : txnHistory[j] = op2
-  BY DEF Range
-<1>. QED
-  BY <1>1, <1>2 DEF Inv, UniqueOps
+LEMMA RunningFacts ==
+    ASSUME TypeInv, HistInv, NEW t \in RunIds(runningTxns)
+    PROVE  /\ t \in TxnIds
+           /\ Started(txnHistory, t)
+           /\ ~Committed(txnHistory, t)
+           /\ ~Aborted(txnHistory, t)
+           /\ \E r \in runningTxns : r.id = t /\ r.startTime = BT(txnHistory, t)
+  BY DEF HistInv, RunIds
 
-LEMMA UniqueOpsRangeCommit ==
-  ASSUME Inv
-  PROVE  UniqueCommit(txnHistory)
-<1> SUFFICES ASSUME NEW op1 \in Range(txnHistory), NEW op2 \in Range(txnHistory),
-                    op1.type = "commit", op2.type = "commit", op1.txnId = op2.txnId
-             PROVE  op1 = op2
-  BY DEF UniqueCommit
-<1>1. PICK i \in DOMAIN txnHistory : txnHistory[i] = op1
-  BY DEF Range
-<1>2. PICK j \in DOMAIN txnHistory : txnHistory[j] = op2
-  BY DEF Range
-<1>. QED
-  BY <1>1, <1>2 DEF Inv, UniqueOps
+\* Extending a history (with unique ops) does not change begin / commit times.
+LEMMA ExtendTimes ==
+    ASSUME NEW h, NEW h2, UniqueOps(h2), Ops(h) \subseteq Ops(h2), NEW t
+    PROVE  /\ \A b \in Ops(h) : b.type = "begin" /\ b.txnId = t => BT(h2, t) = b.time
+           /\ \A c \in Ops(h) : c.type = "commit" /\ c.txnId = t => CT(h2, t) = c.time
+  BY BTVal, CTVal
 
-LEMMA UniqueOpsRangeBody ==
-  ASSUME Inv
-  PROVE  UniqueBody(txnHistory)
-<1> SUFFICES ASSUME NEW op1 \in Range(txnHistory), NEW op2 \in Range(txnHistory),
-                    op1.type = "body", op2.type = "body", op1.txnId = op2.txnId
-             PROVE  op1 = op2
-  BY DEF UniqueBody
-<1>1. PICK i \in DOMAIN txnHistory : txnHistory[i] = op1
-  BY DEF Range
-<1>2. PICK j \in DOMAIN txnHistory : txnHistory[j] = op2
-  BY DEF Range
-<1>. QED
-  BY <1>1, <1>2 DEF Inv, UniqueOps
+----------------------------------------------------------------------------
+(***************************************************************************)
+(* AbortTxn preserves the invariant.                                       *)
+(***************************************************************************)
 
-LEMMA InvTimedOpsOK ==
-  ASSUME Inv
-  PROVE  TimedOpsOK(txnHistory)
-BY DEF Inv, OpShape, TimedOpsOK
-
-LEMMA InvCommittedOK ==
-  ASSUME Inv
-  PROVE  CommittedOK(txnHistory)
-<1> SUFFICES ASSUME NEW t \in SI!CommittedTxns(txnHistory)
-             PROVE  /\ \E b \in Range(txnHistory) : b.type = "begin" /\ b.txnId = t
-                    /\ \E c \in Range(txnHistory) : c.type = "commit" /\ c.txnId = t
-  BY DEF CommittedOK
-<1>1. PICK c \in Range(txnHistory) : c.type = "commit" /\ c.txnId = t
-  BY RangeEq DEF SI!CommittedTxns
-<1>. QED
-  BY <1>1 DEF Inv, CommitHasPreds
-
-LEMMA InvH1 ==
-  ASSUME Inv
-  PROVE  H1(txnHistory)
-BY DEF Inv, H1inv, H1
-
-LEMMA InvH2 ==
-  ASSUME Inv
-  PROVE  H2(txnHistory)
-<1> SUFFICES ASSUME NEW t \in SI!CommittedTxns(txnHistory),
-                    SI!KeysWrittenByTxn(txnHistory, t) # {},
-                    NEW k \in Keys,
-                    SI!ReadsKey(txnHistory, t, k),
-                    \E t2 \in SI!CommittedTxns(txnHistory) : SI!WritesKey(txnHistory, t2, k)
-             PROVE  SI!WritesKey(txnHistory, t, k)
-  BY DEF H2
-<1>1. PICK t2 \in SI!CommittedTxns(txnHistory) : SI!WritesKey(txnHistory, t2, k)
-  OBVIOUS
-<1>2. PICK d \in Range(txnHistory) : d.txnId = t /\ d.type = "body" /\ k \in d.reads
-  BY RangeEq DEF SI!ReadsKey
-<1>3. BodyH2(d)
-  BY <1>2 DEF Inv, H2inv
-<1>4. PICK d2 \in Range(txnHistory) : d2.txnId = t /\ d2.type = "body" /\ \E w \in d2.writes : TRUE
-  BY RangeEq DEF SI!KeysWrittenByTxn, SI!WritesKey
-<1>5. d2 = d
-  BY <1>2, <1>4, UniqueOpsRangeBody DEF UniqueBody
-<1>6. d.writes # {}
-  BY <1>4, <1>5
-<1>7. \/ \E w \in d.writes : w.key = k
-      \/ ReadOnlyCol(k)
-  BY <1>2, <1>3, <1>6 DEF BodyH2
-<1>8. CASE \E w \in d.writes : w.key = k
-  BY <1>2, <1>8, RangeEq DEF SI!WritesKey
-<1>9. CASE ReadOnlyCol(k)
-  <2>1. PICK opw \in Range(txnHistory) :
-          opw.txnId = t2 /\ opw.type = "body" /\ \E w \in opw.writes : w.key = k
-    BY <1>1, RangeEq DEF SI!WritesKey
-  <2>2. PICK w \in opw.writes : w.key = k
-    BY <2>1
-  <2>3. ~ReadOnlyCol(w.key)
-    BY <2>1 DEF Inv, NoWriteROinv, NoWriteRO
-  <2>. QED
-    BY <1>9, <2>2, <2>3
-<1>. QED
-  BY <1>7, <1>8, <1>9
-
-LEMMA InvH3 ==
-  ASSUME Inv
-  PROVE  H3(txnHistory)
-<1> SUFFICES ASSUME NEW t1 \in SI!CommittedTxns(txnHistory),
-                    NEW t2 \in SI!CommittedTxns(txnHistory),
-                    t1 # t2,
-                    SI!KeysWrittenByTxn(txnHistory, t1) \cap SI!KeysWrittenByTxn(txnHistory, t2) # {},
-                    NEW b1 \in Range(txnHistory), NEW c1 \in Range(txnHistory),
-                    NEW b2 \in Range(txnHistory), NEW c2 \in Range(txnHistory),
-                    b1.type = "begin",  b1.txnId = t1,
-                    c1.type = "commit", c1.txnId = t1,
-                    b2.type = "begin",  b2.txnId = t2,
-                    c2.type = "commit", c2.txnId = t2
-             PROVE  c1.time < b2.time \/ c2.time < b1.time
-  BY DEF H3
-<1>. QED
-  BY DEF Inv, H3inv
-
-LEMMA InvHistFacts ==
-  ASSUME Inv
-  PROVE  HistFacts(txnHistory)
-BY UniqueOpsRangeBegin, UniqueOpsRangeCommit, UniqueOpsRangeBody,
-   InvTimedOpsOK, InvCommittedOK, InvH1, InvH2, InvH3
-   DEF HistFacts
-
-LEMMA InvSerializable ==
-  ASSUME Inv
-  PROVE  SerializableViaPath
-<1>1. HistFacts(txnHistory)
-  BY InvHistFacts
-<1>2. SI!IsConflictSerializableViaPath(txnHistory)
-  BY <1>1, HistFactsSerializable
-<1>. QED
-  BY <1>2 DEF SerializableViaPath, SI!SerializableViaPath
-
------------------------------------------------------------------------------
-(*****************************************************************************)
-(* 8.  Init                                                                  *)
-(*****************************************************************************)
-
-LEMMA InitInv == Init => Inv
-<1> SUFFICES ASSUME Init
-             PROVE  Inv
-  OBVIOUS
-<1>1. txnHistory = <<>>
-  BY DEF Init
-<1>2. Range(txnHistory) = {}
-  BY <1>1, EmptyRange
-<1>3. clock = 0
-  BY DEF Init
-<1>4. runningTxns = {}
-  BY DEF Init
-<1>5. HistSeq
-  <2>1. <<>> \in Seq({})
-    BY EmptySeq
-  <2>. QED
-    BY <1>1, <2>1 DEF HistSeq
-<1>6. ClockType
-  BY <1>3 DEF ClockType
-<1>7. OpShape
-  BY <1>2 DEF OpShape
-<1>8. UniqueOps
-  BY <1>1 DEF UniqueOps
-<1>9. TimesMono
-  BY <1>1 DEF TimesMono
-<1>10. TimesVsClock
-  BY <1>2 DEF TimesVsClock
-<1>11. OrderOK
-  BY <1>1 DEF OrderOK
-<1>12. CommitHasPreds
-  BY <1>2 DEF CommitHasPreds
-<1>13. AbortHasPreds
-  BY <1>2 DEF AbortHasPreds
-<1>14. H1inv
-  BY <1>2 DEF H1inv
-<1>15. H2inv
-  BY <1>2 DEF H2inv
-<1>16. NoWriteROinv
-  BY <1>2 DEF NoWriteROinv, NoWriteRO
-<1>17. H3inv
-  BY <1>2 DEF H3inv
-<1>18. CommitKeys
-  BY <1>2 DEF CommitKeys
-<1>19. RunningOK
-  BY <1>4 DEF RunningOK
-<1>. QED
-  BY <1>5, <1>6, <1>7, <1>8, <1>9, <1>10, <1>11, <1>12, <1>13,
-     <1>14, <1>15, <1>16, <1>17, <1>18, <1>19
-  DEF Inv
-
------------------------------------------------------------------------------
-(*****************************************************************************)
-(* 9.  Stuttering                                                            *)
-(*****************************************************************************)
-
-LEMMA UnchangedInv ==
-  ASSUME Inv, UNCHANGED vars
-  PROVE  Inv'
-BY DEF Inv, vars, HistSeq, ClockType, OpShape, UniqueOps, TimesMono, TimesVsClock,
-       OrderOK, CommitHasPreds, AbortHasPreds, H1inv, H2inv, NoWriteROinv, NoWriteRO,
-       H3inv, CommitKeys, RunningOK
-
------------------------------------------------------------------------------
-(*****************************************************************************)
-(* 10. AbortTxn                                                              *)
-(*****************************************************************************)
-
-LEMMA AbortInv ==
-  ASSUME Inv, NEW tid \in TxnIds, AbortTxn(tid)
-  PROVE  Inv'
-<1>1. PICK abortOp :
-        /\ abortOp = [type |-> "abort", txnId |-> tid, time |-> clock + 1]
-        /\ txnHistory' = Append(txnHistory, abortOp)
+THEOREM AbortStep ==
+    ASSUME Inv, NEW tid \in TxnIds, AbortTxn(tid)
+    PROVE  Inv'
+  <1> DEFINE h == txnHistory
+             aop == [type |-> "abort", txnId |-> tid, time |-> clock + 1]
+  <1> USE DEF Inv
+  <1>0. /\ tid \in RunIds(runningTxns)
+        /\ txnHistory' = Append(h, aop)
         /\ runningTxns' = {r \in runningTxns : r.id # tid}
         /\ clock' = clock + 1
         /\ UNCHANGED <<dataStore, txnSnapshots, txnProg, txnReq>>
-  BY DEF AbortTxn, SI!AbortTxn
-<1>2. PICK S : txnHistory \in Seq(S)
-  BY DEF Inv, HistSeq
-<1>3. txnHistory' \in Seq(S \cup {abortOp})
-  BY <1>1, <1>2, HistSeqAppend
-<1>4. Range(txnHistory') = Range(txnHistory) \cup {abortOp}
-  BY <1>1, <1>2, RangeAppend
-<1>5. abortOp.type = "abort" /\ abortOp.txnId = tid /\ abortOp.time = clock + 1
-  BY <1>1
-<1>6. clock \in Nat
-  BY DEF Inv, ClockType
-<1>7. tid \in SI!RunningTxnIds
-  BY DEF AbortTxn, SI!AbortTxn
-<1>8. PICK rtxn \in runningTxns : rtxn.id = tid
-  BY <1>7 DEF SI!RunningTxnIds
-<1>9. \E b \in Range(txnHistory) : b.type = "begin" /\ b.txnId = tid
-      /\ \E d \in Range(txnHistory) : d.type = "body" /\ d.txnId = tid
-      /\ ~\E c \in Range(txnHistory) : c.type \in {"commit", "abort"} /\ c.txnId = tid
-  BY <1>8 DEF Inv, RunningOK
-<1>10. HistSeq'
-  BY <1>3 DEF HistSeq
-<1>11. ClockType'
-  BY <1>1, <1>6 DEF ClockType
-<1>12. OpShape'
-  <2> SUFFICES ASSUME NEW op \in Range(txnHistory')
-               PROVE  /\ "type" \in DOMAIN op
-                      /\ "txnId" \in DOMAIN op
-                      /\ op.txnId \in TxnIds
-                      /\ op.type \in {"begin", "body", "commit", "abort"}
-                      /\ op.type \in {"begin", "commit", "abort"} =>
-                           "time" \in DOMAIN op /\ op.time \in Nat
-                      /\ op.type = "body" =>
-                           /\ "reads" \in DOMAIN op
-                           /\ "writes" \in DOMAIN op
-                           /\ \A w \in op.writes : "key" \in DOMAIN w
-                      /\ op.type = "commit" => "updatedKeys" \in DOMAIN op
-    BY DEF OpShape
-  <2>1. CASE op \in Range(txnHistory)
-    BY <2>1 DEF Inv, OpShape
-  <2>2. CASE op = abortOp
-    <3>1. "type" \in DOMAIN abortOp /\ "txnId" \in DOMAIN abortOp /\ "time" \in DOMAIN abortOp
-      BY <1>1
-    <3>2. abortOp.txnId \in TxnIds
-      BY <1>5
-    <3>3. abortOp.time \in Nat
-      BY <1>5, <1>6
-    <3>. QED
-      BY <2>2, <1>5, <3>1, <3>2, <3>3
-  <2>. QED
-    BY <1>4, <2>1, <2>2
-<1>13. UniqueOps'
-  <2> SUFFICES ASSUME NEW i \in DOMAIN txnHistory', NEW j \in DOMAIN txnHistory',
-                      txnHistory'[i].type = txnHistory'[j].type,
-                      txnHistory'[i].txnId = txnHistory'[j].txnId
-               PROVE  i = j
-    BY DEF UniqueOps
-  <2>1. DOMAIN txnHistory' = 1..(Len(txnHistory)+1)
-    BY <1>1, <1>2, AppendProperties, LenProperties
-  <2>2. DOMAIN txnHistory = 1..Len(txnHistory)
-    BY <1>2, LenProperties
-  <2>3. Len(txnHistory) \in Nat
-    BY <1>2, LenProperties
-  <2>4. \A ii \in DOMAIN txnHistory : txnHistory'[ii] = txnHistory[ii]
-    BY <1>1, <1>2, AppendProperties
-  <2>5. txnHistory'[Len(txnHistory)+1] = abortOp
-    BY <1>1, <1>2, AppendProperties, LenProperties
-  <2>6. CASE i \in DOMAIN txnHistory /\ j \in DOMAIN txnHistory
-    BY <2>4, <2>6 DEF Inv, UniqueOps
-  <2>7. CASE i = Len(txnHistory)+1
-    <3>1. txnHistory'[i].type = "abort" /\ txnHistory'[i].txnId = tid
-      BY <2>5, <2>7, <1>5
-    <3>2. CASE j \in DOMAIN txnHistory
-      <4>1. txnHistory'[j] = txnHistory[j]
-        BY <2>4, <3>2
-      <4>2. txnHistory[j] \in Range(txnHistory)
-        BY <3>2 DEF Range
-      <4>3. txnHistory[j].type = "abort" /\ txnHistory[j].txnId = tid
-        BY <3>1, <4>1
-      <4>. QED
-        BY <1>9, <4>2, <4>3
-    <3>3. CASE j = Len(txnHistory)+1
-      BY <2>7, <3>3
-    <3>. QED
-      BY <2>1, <2>2, <3>2, <3>3
-  <2>8. CASE j = Len(txnHistory)+1
-    <3>1. CASE i \in DOMAIN txnHistory
-      <4>1. txnHistory'[j].type = "abort" /\ txnHistory'[j].txnId = tid
-        BY <2>5, <2>8, <1>5
-      <4>2. txnHistory'[i] = txnHistory[i]
-        BY <2>4, <3>1
-      <4>3. txnHistory[i] \in Range(txnHistory)
-        BY <3>1 DEF Range
-      <4>4. txnHistory[i].type = "abort" /\ txnHistory[i].txnId = tid
-        BY <4>1, <4>2
-      <4>. QED
-        BY <1>9, <4>3, <4>4
-    <3>2. CASE i = Len(txnHistory)+1
-      BY <2>8, <3>2
-    <3>. QED
-      BY <2>1, <2>2, <3>1, <3>2
-  <2>. QED
-    BY <2>1, <2>2, <2>6, <2>7, <2>8
-<1>14. TimesMono'
-  <2> SUFFICES ASSUME NEW i \in DOMAIN txnHistory', NEW j \in DOMAIN txnHistory',
-                      i < j,
-                      txnHistory'[i].type \in {"begin", "commit", "abort"},
-                      txnHistory'[j].type \in {"begin", "commit", "abort"}
-               PROVE  txnHistory'[i].time < txnHistory'[j].time
-    BY DEF TimesMono
-  <2>1. \A ii \in DOMAIN txnHistory : txnHistory'[ii] = txnHistory[ii]
-    BY <1>1, <1>2, AppendProperties
-  <2>2. CASE j \in DOMAIN txnHistory
-    <3>1. i \in DOMAIN txnHistory
-      BY <1>1, <1>2, <2>2, AppendProperties, LenProperties
-    <3>. QED
-      BY <2>1, <3>1, <2>2 DEF Inv, TimesMono
-  <2>3. CASE j = Len(txnHistory)+1
-    <3>1. i \in DOMAIN txnHistory
-      BY <2>3, <1>2, LenProperties
-    <3>2. txnHistory'[i] = txnHistory[i]
-      BY <2>1, <3>1
-    <3>3. txnHistory[i] \in Range(txnHistory)
-      BY <3>1 DEF Range
-    <3>4. txnHistory[i].time <= clock
-      BY <3>2, <3>3 DEF Inv, TimesVsClock, OpShape
-    <3>5. txnHistory[i].time \in Nat
-      BY <3>2, <3>3 DEF Inv, OpShape
-    <3>6. txnHistory'[j] = abortOp
-      BY <1>1, <1>2, <2>3, AppendProperties, LenProperties
-    <3>. QED
-      BY <3>2, <3>4, <3>5, <3>6, <1>5, <1>6
-  <2>. QED
-    BY <1>1, <1>2, <2>2, <2>3, AppendProperties, LenProperties
-<1>15. TimesVsClock'
-  <2> SUFFICES ASSUME NEW op \in Range(txnHistory'),
-                      op.type \in {"begin", "commit", "abort"}
-               PROVE  op.time <= clock'
-    BY DEF TimesVsClock
-  <2>1. CASE op \in Range(txnHistory)
-    <3>1. op.time <= clock
-      BY <2>1 DEF Inv, TimesVsClock
-    <3>2. op.time \in Nat
-      BY <2>1 DEF Inv, OpShape
-    <3>. QED
-      BY <1>1, <1>6, <3>1, <3>2
-  <2>2. CASE op = abortOp
-    BY <1>1, <1>5, <1>6, <2>2
-  <2>. QED
-    BY <1>4, <2>1, <2>2
-<1>16. OrderOK'
-  <2>1. \A ii \in DOMAIN txnHistory : txnHistory'[ii] = txnHistory[ii]
-    BY <1>1, <1>2, AppendProperties
-  <2>2. txnHistory'[Len(txnHistory)+1] = abortOp
-    BY <1>1, <1>2, AppendProperties, LenProperties
-  <2>3. \A i, j \in DOMAIN txnHistory' :
-           txnHistory'[i].txnId = txnHistory'[j].txnId
-           /\ txnHistory'[i].type = "begin"
-           /\ txnHistory'[j].type \in {"body", "commit", "abort"}
-           => i < j
-    <3> SUFFICES ASSUME NEW i \in DOMAIN txnHistory', NEW j \in DOMAIN txnHistory',
-                        txnHistory'[i].txnId = txnHistory'[j].txnId,
-                        txnHistory'[i].type = "begin",
-                        txnHistory'[j].type \in {"body", "commit", "abort"}
-                 PROVE  i < j
+    BY DEF AbortTxn, SI!AbortTxn, SI!RunningTxnIds, RunIds
+  <1>1. Ops(h') = Ops(h) \cup {aop} /\ h' \in Seq(Ops(h'))
+    <2>1. h \in Seq(Ops(h))
+      BY DEF TypeInv
+    <2>2. Ops(Append(h, aop)) = Ops(h) \cup {aop} /\ Append(h, aop) \in Seq(Ops(h) \cup {aop})
+      BY <2>1, RangeAppend
+    <2> QED
+      BY <2>2, <1>0
+  <1>2. ~Aborted(h, tid) /\ ~Committed(h, tid) /\ Started(h, tid)
+    BY <1>0, RunningFacts
+  <1>3. UniqueOps(h')
+    BY <1>1, <1>2 DEF HistInv, UniqueOps, Aborted
+  <1>4. /\ \A t : Started(h', t) <=> Started(h, t)
+        /\ \A t : Committed(h', t) <=> Committed(h, t)
+        /\ \A t : Aborted(h', t) <=> (Aborted(h, t) \/ t = tid)
+    BY <1>1, <1>2 DEF Started, Committed, Aborted
+  <1>5. \A t : Started(h, t) => BT(h', t) = BT(h, t)
+    <2> SUFFICES ASSUME NEW t, Started(h, t) PROVE BT(h', t) = BT(h, t)
       OBVIOUS
-    <3>1. CASE i \in DOMAIN txnHistory /\ j \in DOMAIN txnHistory
-      BY <2>1, <3>1 DEF Inv, OrderOK
-    <3>2. CASE j = Len(txnHistory)+1
-      <4>0. i # Len(txnHistory)+1
-        BY <1>5, <2>2, <3>2
-      <4>1. i \in DOMAIN txnHistory
-        BY <1>1, <1>2, <3>2, <4>0, AppendProperties, LenProperties
-      <4>2. Len(txnHistory) \in Nat
-        BY <1>2, LenProperties
-      <4>. QED
-        BY <4>1, <3>2, <4>2
-    <3>3. CASE i = Len(txnHistory)+1
-      BY <1>5, <2>2, <3>3
-    <3>. QED
-      BY <1>1, <1>2, <3>1, <3>2, <3>3, AppendProperties, LenProperties
-  <2>4. \A i, j \in DOMAIN txnHistory' :
-           txnHistory'[i].txnId = txnHistory'[j].txnId
-           /\ txnHistory'[i].type = "body"
-           /\ txnHistory'[j].type \in {"commit", "abort"}
-           => i < j
-    <3> SUFFICES ASSUME NEW i \in DOMAIN txnHistory', NEW j \in DOMAIN txnHistory',
-                        txnHistory'[i].txnId = txnHistory'[j].txnId,
-                        txnHistory'[i].type = "body",
-                        txnHistory'[j].type \in {"commit", "abort"}
-                 PROVE  i < j
+    <2>1. PICK b \in Ops(h) : b.txnId = t /\ b.type = "begin" /\ b.time = BT(h, t)
+      BY StartedFacts
+    <2> QED
+      BY <2>1, <1>1, <1>3, ExtendTimes
+  <1>6. \A t : Committed(h, t) => CT(h', t) = CT(h, t)
+    <2> SUFFICES ASSUME NEW t, Committed(h, t) PROVE CT(h', t) = CT(h, t)
       OBVIOUS
-    <3>1. CASE i \in DOMAIN txnHistory /\ j \in DOMAIN txnHistory
-      BY <2>1, <3>1 DEF Inv, OrderOK
-    <3>2. CASE j = Len(txnHistory)+1
-      <4>0. i # Len(txnHistory)+1
-        BY <1>5, <2>2, <3>2
-      <4>1. i \in DOMAIN txnHistory
-        BY <1>1, <1>2, <3>2, <4>0, AppendProperties, LenProperties
-      <4>2. Len(txnHistory) \in Nat
-        BY <1>2, LenProperties
-      <4>. QED
-        BY <4>1, <3>2, <4>2
-    <3>3. CASE i = Len(txnHistory)+1
-      BY <1>5, <2>2, <3>3
-    <3>. QED
-      BY <1>1, <1>2, <3>1, <3>2, <3>3, AppendProperties, LenProperties
-  <2>. QED
-    BY <2>3, <2>4 DEF OrderOK
-<1>17. CommitHasPreds'
-  <2> SUFFICES ASSUME NEW c \in Range(txnHistory'), c.type = "commit"
-               PROVE  /\ \E b \in Range(txnHistory') : b.type = "begin" /\ b.txnId = c.txnId
-                      /\ \E d \in Range(txnHistory') : d.type = "body"  /\ d.txnId = c.txnId
-    BY DEF CommitHasPreds
-  <2>1. c \in Range(txnHistory)
-    BY <1>4, <1>5
-  <2>. QED
-    BY <1>4, <2>1 DEF Inv, CommitHasPreds
-<1>18. AbortHasPreds'
-  <2> SUFFICES ASSUME NEW a \in Range(txnHistory'), a.type = "abort"
-               PROVE  /\ \E b \in Range(txnHistory') : b.type = "begin" /\ b.txnId = a.txnId
-                      /\ \E d \in Range(txnHistory') : d.type = "body"  /\ d.txnId = a.txnId
-    BY DEF AbortHasPreds
-  <2>1. CASE a \in Range(txnHistory)
-    BY <1>4, <2>1 DEF Inv, AbortHasPreds
-  <2>2. CASE a = abortOp
-    BY <1>4, <1>5, <1>9, <2>2
-  <2>. QED
-    BY <1>4, <2>1, <2>2
-<1>19. H1inv'
-  <2> SUFFICES ASSUME NEW b \in Range(txnHistory'), NEW c \in Range(txnHistory'),
-                      b.type = "begin", c.type = "commit", b.txnId = c.txnId
-               PROVE  b.time < c.time
-    BY DEF H1inv
-  <2>1. b \in Range(txnHistory) /\ c \in Range(txnHistory)
-    BY <1>4, <1>5
-  <2>. QED
-    BY <2>1 DEF Inv, H1inv
-<1>20. H2inv'
-  <2> SUFFICES ASSUME NEW d \in Range(txnHistory'), d.type = "body"
-               PROVE  BodyH2(d)
-    BY DEF H2inv
-  <2>1. d \in Range(txnHistory)
-    BY <1>4, <1>5
-  <2>. QED
-    BY <2>1 DEF Inv, H2inv
-<1>21. NoWriteROinv'
-  <2> SUFFICES ASSUME NEW op \in Range(txnHistory'), op.type = "body",
-                      NEW w \in op.writes
-               PROVE  ~ReadOnlyCol(w.key)
-    BY DEF NoWriteROinv, NoWriteRO
-  <2>1. op \in Range(txnHistory)
-    BY <1>4, <1>5
-  <2>. QED
-    BY <2>1 DEF Inv, NoWriteROinv, NoWriteRO
-<1>22. H3inv'
-  <2> SUFFICES ASSUME NEW c1 \in Range(txnHistory'), NEW c2 \in Range(txnHistory'),
-                      c1.type = "commit", c2.type = "commit",
-                      c1.txnId # c2.txnId,
-                      SI!KeysWrittenByTxn(txnHistory', c1.txnId)
-                        \cap SI!KeysWrittenByTxn(txnHistory', c2.txnId) # {}
-               PROVE  \A b1, b2 \in Range(txnHistory') :
-                        b1.type = "begin" /\ b1.txnId = c1.txnId /\
-                        b2.type = "begin" /\ b2.txnId = c2.txnId
-                        => c1.time < b2.time \/ c2.time < b1.time
-    BY DEF H3inv
-  <2>1. c1 \in Range(txnHistory) /\ c2 \in Range(txnHistory)
-    BY <1>4, <1>5
-  <2>2. SI!KeysWrittenByTxn(txnHistory', c1.txnId) = SI!KeysWrittenByTxn(txnHistory, c1.txnId)
-    BY <1>1, <1>2, <1>5, KeysWrittenUnchangedNonBody
-  <2>3. SI!KeysWrittenByTxn(txnHistory', c2.txnId) = SI!KeysWrittenByTxn(txnHistory, c2.txnId)
-    BY <1>1, <1>2, <1>5, KeysWrittenUnchangedNonBody
-  <2>4. \A b1, b2 \in Range(txnHistory) :
-           b1.type = "begin" /\ b1.txnId = c1.txnId /\
-           b2.type = "begin" /\ b2.txnId = c2.txnId
-           => c1.time < b2.time \/ c2.time < b1.time
-    BY <2>1, <2>2, <2>3 DEF Inv, H3inv
-  <2>. QED
-    BY <1>4, <1>5, <2>4
-<1>23. CommitKeys'
-  <2> SUFFICES ASSUME NEW c \in Range(txnHistory'), c.type = "commit"
-               PROVE  c.updatedKeys = SI!KeysWrittenByTxn(txnHistory', c.txnId)
-    BY DEF CommitKeys
-  <2>1. c \in Range(txnHistory)
-    BY <1>4, <1>5
-  <2>2. c.updatedKeys = SI!KeysWrittenByTxn(txnHistory, c.txnId)
-    BY <2>1 DEF Inv, CommitKeys
-  <2>3. SI!KeysWrittenByTxn(txnHistory', c.txnId) = SI!KeysWrittenByTxn(txnHistory, c.txnId)
-    BY <1>1, <1>2, <1>5, KeysWrittenUnchangedNonBody
-  <2>. QED
-    BY <2>2, <2>3
-<1>24. RunningOK'
-  <2>1. runningTxns' \subseteq [id : TxnIds, startTime : Nat, commitTime : {Empty}]
-    BY <1>1 DEF Inv, RunningOK
-  <2>2. \A txn \in runningTxns' :
-           /\ \E b \in Range(txnHistory') :
-                 b.type = "begin" /\ b.txnId = txn.id /\ b.time = txn.startTime
-           /\ \E d \in Range(txnHistory') : d.type = "body" /\ d.txnId = txn.id
-           /\ ~\E c \in Range(txnHistory') : c.type \in {"commit", "abort"} /\ c.txnId = txn.id
-    <3> SUFFICES ASSUME NEW txn \in runningTxns'
-                 PROVE  /\ \E b \in Range(txnHistory') :
-                              b.type = "begin" /\ b.txnId = txn.id /\ b.time = txn.startTime
-                        /\ \E d \in Range(txnHistory') : d.type = "body" /\ d.txnId = txn.id
-                        /\ ~\E c \in Range(txnHistory') : c.type \in {"commit", "abort"} /\ c.txnId = txn.id
+    <2>1. PICK c \in Ops(h) : c.txnId = t /\ c.type = "commit"
+      BY DEF Committed
+    <2>2. CT(h, t) = c.time
+      BY <2>1, CTVal DEF HistInv, UniqueOps
+    <2> QED
+      BY <2>1, <2>2, <1>1, <1>3, ExtendTimes
+  <1>7. \A t : Started(h, t) => (Doomed(h', txnProg', t) <=> Doomed(h, txnProg, t))
+    BY <1>0, <1>1, <1>5 DEF Doomed, KW
+  <1>8. RunIds(runningTxns') = RunIds(runningTxns) \ {tid}
+    BY <1>0 DEF RunIds
+  <1>9. TypeInv'
+    BY <1>0, <1>1 DEF TypeInv
+  <1>10. HistInv'
+    <2>1. \A op \in Ops(h') :
+            /\ op.txnId \in TxnIds
+            /\ op.type \in {"begin", "body", "commit", "abort"}
+            /\ op.type = "body" => /\ op.reads  = txnProg'[op.txnId].reads
+                                   /\ op.writes = txnProg'[op.txnId].writes
+            /\ op.type \in {"begin", "commit", "abort"} => op.time \in Nat /\ op.time =< clock'
+            /\ op.type = "commit" => /\ op.updatedKeys = KW(txnProg', op.txnId)
+                                     /\ BT(h', op.txnId) < op.time
+      <3> SUFFICES ASSUME NEW op \in Ops(h') PROVE
+            /\ op.txnId \in TxnIds
+            /\ op.type \in {"begin", "body", "commit", "abort"}
+            /\ op.type = "body" => /\ op.reads  = txnProg'[op.txnId].reads
+                                   /\ op.writes = txnProg'[op.txnId].writes
+            /\ op.type \in {"begin", "commit", "abort"} => op.time \in Nat /\ op.time =< clock'
+            /\ op.type = "commit" => /\ op.updatedKeys = KW(txnProg', op.txnId)
+                                     /\ BT(h', op.txnId) < op.time
+        OBVIOUS
+      <3>1. CASE op = aop
+        BY <3>1, <1>0 DEF TypeInv
+      <3>2. CASE op \in Ops(h)
+        <4>1. Started(h, op.txnId)
+          BY <3>2 DEF Started
+        <4> QED
+          BY <3>2, <4>1, <1>0, <1>5 DEF HistInv, TypeInv, KW
+      <3> QED
+        BY <3>1, <3>2, <1>1
+    <2>2. \A t \in TxnIds : Started(h', t) =>
+            /\ \E op \in Ops(h') : op.txnId = t /\ op.type = "begin"
+            /\ \E op \in Ops(h') : op.txnId = t /\ op.type = "body"
+      BY <1>1, <1>4 DEF HistInv
+    <2>3. \A r \in runningTxns' :
+            /\ r.id \in TxnIds
+            /\ Started(h', r.id)
+            /\ r.startTime = BT(h', r.id)
+            /\ ~Committed(h', r.id)
+            /\ ~Aborted(h', r.id)
+      BY <1>0, <1>4, <1>5 DEF HistInv
+    <2> QED
+      BY <2>1, <2>2, <2>3, <1>3 DEF HistInv, UniqueOps
+  <1>11. SnapInv'
+    BY <1>0, <1>4 DEF SnapInv, KW
+  <1>12. DataInv'
+    BY <1>0 DEF DataInv, DataInvS
+  <1>13. BodyInv'
+    <2> SUFFICES ASSUME NEW t \in TxnIds, Started(h', t)
+                 PROVE  /\ Static(txnReq'[t], txnProg'[t])
+                        /\ DelDyn(txnReq'[t], txnProg'[t], dataStore')
+                        /\ txnReq'[t].type = "NewOrder" =>
+                              \E o \in OIds :
+                                  /\ NOStatic(txnReq'[t], txnProg'[t], o)
+                                  /\ (t \in RunIds(runningTxns') /\ ~Doomed(h', txnProg', t)) =>
+                                        dataStore'[NK(txnReq'[t].w, txnReq'[t].d)] = o
+      BY DEF BodyInv
+    <2>1. Started(h, t)
+      BY <1>4
+    <2> QED
+      BY <2>1, <1>0, <1>7, <1>8 DEF BodyInv
+  <1>14. SafeInv'
+    <2>1. \A t1 \in RunIds(runningTxns') : Started(h, t1)
+      BY <1>8, RunningFacts
+    <2> QED
+      BY <2>1, <1>0, <1>4, <1>5, <1>6, <1>7, <1>8 DEF SafeInv
+  <1>15. RWInv'
+    <2>1. \A t : Committed(h, t) => Started(h, t)
+      BY DEF Committed, Started
+    <2> QED
+      BY <2>1, <1>0, <1>4, <1>5, <1>6 DEF RWInv
+  <1> QED
+    BY <1>9, <1>10, <1>11, <1>12, <1>13, <1>14, <1>15
+
+----------------------------------------------------------------------------
+(***************************************************************************)
+(* StartAndRun preserves the invariant.                                    *)
+(***************************************************************************)
+
+THEOREM StartStep ==
+    ASSUME Inv, NEW tid \in TxnIds, NEW req \in Requests, StartAndRun(tid, req)
+    PROVE  Inv'
+  <1> DEFINE h == txnHistory
+             P == txnProg
+             B == ProgramFor(tid, req, dataStore)
+             bop == [type |-> "begin", txnId |-> tid, time |-> clock + 1]
+             bdy == [type |-> "body", txnId |-> tid, reads |-> B.reads, writes |-> B.writes]
+             newTxn == [id |-> tid, startTime |-> clock + 1, commitTime |-> Empty]
+  <1> USE DEF Inv
+  <1>0. /\ ReqEnabled(req, dataStore)
+        /\ ~Started(h, tid)
+        /\ txnSnapshots' = [txnSnapshots EXCEPT ![tid] = SI!ApplyWrites(dataStore, B.writes)]
+        /\ txnProg' = [txnProg EXCEPT ![tid] = B]
+        /\ h' = h \o <<bop, bdy>>
+        /\ runningTxns' = runningTxns \cup {newTxn}
+        /\ clock' = clock + 1
+        /\ dataStore' = dataStore
+        /\ txnReq' = [txnReq EXCEPT ![tid] = req]
+    BY DEF StartAndRun, SI!StartAndRun, Started, Ops
+  <1>1. Ops(h') = Ops(h) \cup {bop, bdy} /\ h' \in Seq(Ops(h'))
+    <2>1. h \in Seq(Ops(h))
+      BY DEF TypeInv
+    <2>2. Ops(h \o <<bop, bdy>>) = Ops(h) \cup {bop, bdy} /\ h \o <<bop, bdy>> \in Seq(Ops(h) \cup {bop, bdy})
+      BY <2>1, RangeConcat2
+    <2> QED
+      BY <2>2, <1>0
+  <1>b. \A op \in Ops(h) : op.txnId # tid
+    BY <1>0 DEF Started
+  <1>2. UniqueOps(h')
+    <2> SUFFICES ASSUME NEW op1 \in Ops(h'), NEW op2 \in Ops(h'),
+                        op1.txnId = op2.txnId, op1.type = op2.type
+                 PROVE  op1 = op2
+      BY DEF UniqueOps
+    <2>1. CASE op1 \in Ops(h) /\ op2 \in Ops(h)
+      BY <2>1 DEF HistInv
+    <2>2. CASE op1 \in Ops(h) /\ op2 \notin Ops(h)
+      BY <2>2, <1>b, <1>1
+    <2>3. CASE op1 \notin Ops(h) /\ op2 \in Ops(h)
+      BY <2>3, <1>b, <1>1
+    <2>4. CASE op1 \notin Ops(h) /\ op2 \notin Ops(h)
+      BY <2>4, <1>1
+    <2> QED
+      BY <2>1, <2>2, <2>3, <2>4
+  <1>3. /\ \A t : Started(h', t) <=> (Started(h, t) \/ t = tid)
+        /\ \A t : Committed(h', t) <=> Committed(h, t)
+        /\ \A t : Aborted(h', t) <=> Aborted(h, t)
+    <2>1. \A t : Started(h', t) <=> (Started(h, t) \/ t = tid)
+      BY <1>1 DEF Started
+    <2>2. \A t : Committed(h', t) <=> Committed(h, t)
+      BY <1>1 DEF Committed
+    <2>3. \A t : Aborted(h', t) <=> Aborted(h, t)
+      BY <1>1 DEF Aborted
+    <2> QED
+      BY <2>1, <2>2, <2>3
+  <1>4. /\ \A t : Started(h, t) => BT(h', t) = BT(h, t)
+        /\ BT(h', tid) = clock + 1
+    <2>1. ASSUME NEW t, Started(h, t) PROVE BT(h', t) = BT(h, t)
+      <3>1. PICK b \in Ops(h) : b.txnId = t /\ b.type = "begin" /\ b.time = BT(h, t)
+        BY <2>1, StartedFacts
+      <3> QED
+        BY <3>1, <1>1, <1>2, ExtendTimes
+    <2>2. BT(h', tid) = clock + 1
+      <3>1. bop \in Ops(h') /\ bop.type = "begin" /\ bop.txnId = tid
+        BY <1>1
+      <3> QED
+        BY <3>1, <1>2, BTVal
+    <2> QED
+      BY <2>1, <2>2
+  <1>5. \A t : Committed(h, t) => CT(h', t) = CT(h, t)
+    <2> SUFFICES ASSUME NEW t, Committed(h, t) PROVE CT(h', t) = CT(h, t)
       OBVIOUS
-    <3>1. txn \in runningTxns /\ txn.id # tid
-      BY <1>1
-    <3>2. \E b \in Range(txnHistory) :
-            b.type = "begin" /\ b.txnId = txn.id /\ b.time = txn.startTime
-          /\ \E d \in Range(txnHistory) : d.type = "body" /\ d.txnId = txn.id
-          /\ ~\E c \in Range(txnHistory) : c.type \in {"commit", "abort"} /\ c.txnId = txn.id
-      BY <3>1 DEF Inv, RunningOK
-    <3>3. ~\E c \in Range(txnHistory') : c.type \in {"commit", "abort"} /\ c.txnId = txn.id
-      BY <1>4, <1>5, <3>1, <3>2
-    <3>. QED
-      BY <1>4, <3>2, <3>3
-  <2>3. \A t1, t2 \in runningTxns' : t1.id = t2.id => t1 = t2
-    BY <1>1 DEF Inv, RunningOK
-  <2>. QED
-    BY <2>1, <2>2, <2>3 DEF RunningOK
-<1>. QED
-  BY <1>10, <1>11, <1>12, <1>13, <1>14, <1>15, <1>16, <1>17, <1>18,
-     <1>19, <1>20, <1>21, <1>22, <1>23, <1>24
-  DEF Inv
+    <2>1. PICK c \in Ops(h) : c.txnId = t /\ c.type = "commit"
+      BY DEF Committed
+    <2>2. CT(h, t) = c.time
+      BY <2>1, CTVal DEF HistInv, UniqueOps
+    <2> QED
+      BY <2>1, <2>2, <1>1, <1>2, ExtendTimes
+  <1>6. /\ \A t \in TxnIds : t # tid => /\ txnProg'[t] = txnProg[t]
+                                       /\ txnReq'[t] = txnReq[t]
+                                       /\ txnSnapshots'[t] = txnSnapshots[t]
+                                       /\ KW(txnProg', t) = KW(txnProg, t)
+        /\ txnProg'[tid] = B /\ txnReq'[tid] = req
+        /\ KW(txnProg', tid) = KWB(B)
+    BY <1>0 DEF TypeInv, KW
+  <1>a. \A t : Started(h, t) => t \in TxnIds /\ t # tid
+    BY <1>0 DEF HistInv, Started
+  <1>7. /\ \A t : Started(h, t) => (Doomed(h', txnProg', t) <=> Doomed(h, txnProg, t))
+        /\ ~Doomed(h', txnProg', tid)
+    <2>1. ASSUME NEW t, Started(h, t) PROVE Doomed(h', txnProg', t) <=> Doomed(h, txnProg, t)
+      <3>1. KW(txnProg', t) = KW(txnProg, t) /\ BT(h', t) = BT(h, t)
+        BY <2>1, <1>a, <1>6, <1>4
+      <3>2. \A c \in Ops(h') : c.type = "commit" => c \in Ops(h)
+        BY <1>1
+      <3> QED
+        BY <3>1, <3>2, <1>1 DEF Doomed
+    <2>2. ~Doomed(h', txnProg', tid)
+      <3> SUFFICES ASSUME NEW c \in Ops(h'), c.type = "commit", c.time > BT(h', tid)
+                   PROVE  FALSE
+        BY DEF Doomed
+      <3>1. c \in Ops(h)
+        BY <1>1
+      <3>2. c.time \in Nat /\ c.time =< clock
+        BY <3>1 DEF HistInv
+      <3> QED
+        BY <3>2, <1>4 DEF TypeInv
+    <2> QED
+      BY <2>1, <2>2
+  <1>8. RunIds(runningTxns') = RunIds(runningTxns) \cup {tid} /\ tid \notin RunIds(runningTxns)
+    <2>1. RunIds(runningTxns') = RunIds(runningTxns) \cup {tid}
+      BY <1>0 DEF RunIds
+    <2>2. tid \notin RunIds(runningTxns)
+      BY <1>0, RunningFacts
+    <2> QED
+      BY <2>1, <2>2
+  <1>9. /\ Static(req, B)
+        /\ DelDyn(req, B, dataStore)
+        /\ req.type = "NewOrder" =>
+              /\ dataStore[NK(req.w, req.d)] \in OIds
+              /\ NOStatic(req, B, dataStore[NK(req.w, req.d)])
+    BY <1>0, ProgFor DEF DataInv
+  <1>10. TypeInv'
+    BY <1>0, <1>1 DEF TypeInv
+  <1>11. HistInv'
+    <2>1. \A op \in Ops(h') :
+            /\ op.txnId \in TxnIds
+            /\ op.type \in {"begin", "body", "commit", "abort"}
+            /\ op.type = "body" => /\ op.reads  = txnProg'[op.txnId].reads
+                                   /\ op.writes = txnProg'[op.txnId].writes
+            /\ op.type \in {"begin", "commit", "abort"} => op.time \in Nat /\ op.time =< clock'
+            /\ op.type = "commit" => /\ op.updatedKeys = KW(txnProg', op.txnId)
+                                     /\ BT(h', op.txnId) < op.time
+      <3> SUFFICES ASSUME NEW op \in Ops(h') PROVE
+            /\ op.txnId \in TxnIds
+            /\ op.type \in {"begin", "body", "commit", "abort"}
+            /\ op.type = "body" => /\ op.reads  = txnProg'[op.txnId].reads
+                                   /\ op.writes = txnProg'[op.txnId].writes
+            /\ op.type \in {"begin", "commit", "abort"} => op.time \in Nat /\ op.time =< clock'
+            /\ op.type = "commit" => /\ op.updatedKeys = KW(txnProg', op.txnId)
+                                     /\ BT(h', op.txnId) < op.time
+        OBVIOUS
+      <3>1. CASE op = bop
+        BY <3>1, <1>0 DEF TypeInv
+      <3>2. CASE op = bdy
+        BY <3>2, <1>6
+      <3>3. CASE op \in Ops(h)
+        <4>1. Started(h, op.txnId)
+          BY <3>3 DEF Started
+        <4>2. op.txnId # tid /\ op.txnId \in TxnIds
+          BY <4>1, <1>a
+        <4>3. op.type \in {"begin", "body", "commit", "abort"}
+          BY <3>3 DEF HistInv
+        <4>4. op.type = "body" => /\ op.reads  = txnProg'[op.txnId].reads
+                                  /\ op.writes = txnProg'[op.txnId].writes
+          BY <3>3, <4>2, <1>6 DEF HistInv
+        <4>5. op.type \in {"begin", "commit", "abort"} => op.time \in Nat /\ op.time =< clock'
+          BY <3>3, <1>0 DEF HistInv, TypeInv
+        <4>6. op.type = "commit" => /\ op.updatedKeys = KW(txnProg', op.txnId)
+                                    /\ BT(h', op.txnId) < op.time
+          <5>1. BT(h', op.txnId) = BT(h, op.txnId)
+            BY <4>1, <1>4
+          <5> QED
+            BY <3>3, <4>2, <5>1, <1>6 DEF HistInv
+        <4> QED
+          BY <4>2, <4>3, <4>4, <4>5, <4>6
+      <3> QED
+        BY <3>1, <3>2, <3>3, <1>1
+    <2>2. \A t \in TxnIds : Started(h', t) =>
+            /\ \E op \in Ops(h') : op.txnId = t /\ op.type = "begin"
+            /\ \E op \in Ops(h') : op.txnId = t /\ op.type = "body"
+      BY <1>1, <1>3 DEF HistInv
+    <2>3. \A r \in runningTxns' :
+            /\ r.id \in TxnIds
+            /\ Started(h', r.id)
+            /\ r.startTime = BT(h', r.id)
+            /\ ~Committed(h', r.id)
+            /\ ~Aborted(h', r.id)
+      <3> SUFFICES ASSUME NEW r \in runningTxns' PROVE
+            /\ r.id \in TxnIds
+            /\ Started(h', r.id)
+            /\ r.startTime = BT(h', r.id)
+            /\ ~Committed(h', r.id)
+            /\ ~Aborted(h', r.id)
+        OBVIOUS
+      <3>1. CASE r = newTxn
+        <4>1. ~Committed(h, tid) /\ ~Aborted(h, tid)
+          BY <1>0 DEF Started, Committed, Aborted
+        <4> QED
+          BY <3>1, <4>1, <1>3, <1>4
+      <3>2. CASE r \in runningTxns
+        BY <3>2, <1>3, <1>4 DEF HistInv
+      <3> QED
+        BY <3>1, <3>2, <1>0
+    <2> QED
+      BY <2>1, <2>2, <2>3, <1>2 DEF HistInv, UniqueOps
+  <1>12. SnapInv'
+    <2> SUFFICES ASSUME NEW t \in TxnIds, Started(h', t), NEW k \in KW(txnProg', t)
+                 PROVE  txnSnapshots'[t][k] = WV(txnProg'[t], k)
+      BY DEF SnapInv
+    <2>1. CASE t = tid
+      <3>1. k \in KWB(B) /\ k \in DOMAIN dataStore
+        BY <2>1, <1>6 DEF KWB, TypeInv
+      <3>2. txnSnapshots'[tid] = SI!ApplyWrites(dataStore, B.writes)
+        BY <1>0 DEF TypeInv
+      <3>3. SI!ApplyWrites(dataStore, B.writes)[k] = (CHOOSE wop \in B.writes : wop.key = k).val
+        BY <3>1 DEF SI!ApplyWrites, KWB
+      <3> QED
+        BY <2>1, <3>2, <3>3, <1>6 DEF WV
+    <2>2. CASE t # tid
+      BY <2>2, <1>3, <1>6 DEF SnapInv
+    <2> QED
+      BY <2>1, <2>2
+  <1>13. DataInv'
+    BY <1>0 DEF DataInv, DataInvS
+  <1>14. BodyInv'
+    <2> SUFFICES ASSUME NEW t \in TxnIds, Started(h', t)
+                 PROVE  /\ Static(txnReq'[t], txnProg'[t])
+                        /\ DelDyn(txnReq'[t], txnProg'[t], dataStore')
+                        /\ txnReq'[t].type = "NewOrder" =>
+                              \E o \in OIds :
+                                  /\ NOStatic(txnReq'[t], txnProg'[t], o)
+                                  /\ (t \in RunIds(runningTxns') /\ ~Doomed(h', txnProg', t)) =>
+                                        dataStore'[NK(txnReq'[t].w, txnReq'[t].d)] = o
+      BY DEF BodyInv
+    <2>1. CASE t = tid
+      BY <2>1, <1>0, <1>6, <1>9
+    <2>2. CASE t # tid
+      <3>1. Started(h, t)
+        BY <2>2, <1>3
+      <3> QED
+        BY <3>1, <2>2, <1>0, <1>6, <1>7, <1>8 DEF BodyInv
+    <2> QED
+      BY <2>1, <2>2
+  <1>15. SafeInv'
+    <2>1. \A t1 \in RunIds(runningTxns') : txnReq'[t1].type \in UpdTypes =>
+             \A k \in RNWB(txnProg'[t1]) : \A y \in RunIds(runningTxns') :
+                 (y # t1 /\ k \in KW(txnProg', y)) => Doomed(h', txnProg', y)
+      <3> SUFFICES ASSUME NEW t1 \in RunIds(runningTxns'), txnReq'[t1].type \in UpdTypes,
+                          NEW k \in RNWB(txnProg'[t1]), NEW y \in RunIds(runningTxns'),
+                          y # t1, k \in KW(txnProg', y)
+                   PROVE  Doomed(h', txnProg', y)
+        OBVIOUS
+      <3>1. CASE t1 # tid /\ y # tid
+        <4>1. t1 \in RunIds(runningTxns) /\ y \in RunIds(runningTxns)
+          BY <3>1, <1>8
+        <4>2. Started(h, t1) /\ Started(h, y) /\ t1 \in TxnIds /\ y \in TxnIds
+          BY <4>1, RunningFacts
+        <4>3. Doomed(h, txnProg, y)
+          BY <3>1, <4>1, <4>2, <1>6 DEF SafeInv
+        <4> QED
+          BY <4>2, <4>3, <1>7
+      <3>2. CASE t1 # tid /\ y = tid
+        <4>1. t1 \in RunIds(runningTxns)
+          BY <3>2, <1>8
+        <4>2. Started(h, t1) /\ t1 \in TxnIds
+          BY <4>1, RunningFacts
+        <4> DEFINE rq1 == txnReq[t1]
+        <4>3. /\ Static(rq1, txnProg[t1])
+              /\ DelDyn(rq1, txnProg[t1], dataStore)
+              /\ k \in RNWB(txnProg[t1])
+              /\ rq1.type \in UpdTypes
+          BY <3>2, <4>2, <1>6 DEF BodyInv
+        <4>4. PICK wop \in B.writes : wop.key = k
+          BY <3>2, <1>6 DEF KWB
+        <4>5. CASE rq1.type \in {"NewOrder", "Payment"}
+          <5>1. k.col \in {"tax", "info"}
+            BY <4>3, <4>5 DEF Static
+          <5>2. wop.key.col \notin {"tax", "info"}
+            BY <1>9 DEF Static
+          <5> QED
+            BY <4>4, <5>1, <5>2
+        <4>6. CASE rq1.type = "Delivery"
+          <5>1. /\ k.tbl \in {"ORDER", "ORDERLINE"} /\ k.col \in {"hdr", "items"}
+                /\ k.w \in WIds /\ k.d \in DIds /\ k.o \in OIds
+                /\ k.o < dataStore[NK(k.w, k.d)]
+            BY <4>3, <4>6 DEF Static, DelDyn
+          <5>2. CASE req.type = "NewOrder"
+            <6>1. wop.key.w = req.w /\ wop.key.d = req.d /\ wop.key.o = dataStore[NK(req.w, req.d)]
+              BY <5>1, <5>2, <4>4, <1>9 DEF NOStatic
+            <6> QED
+              BY <6>1, <5>1, <4>4
+          <5>3. CASE req.type # "NewOrder"
+            <6>1. ~(wop.key.tbl \in {"ORDER", "ORDERLINE"} /\ wop.key.col \in {"hdr", "items"})
+              BY <5>3, <1>9 DEF Static
+            <6> QED
+              BY <6>1, <5>1, <4>4
+          <5> QED
+            BY <5>2, <5>3
+        <4> QED
+          BY <4>3, <4>5, <4>6 DEF UpdTypes
+      <3>3. CASE t1 = tid /\ y # tid
+        <4>1. y \in RunIds(runningTxns)
+          BY <3>3, <1>8
+        <4>2. Started(h, y) /\ y \in TxnIds
+          BY <4>1, RunningFacts
+        <4> DEFINE rqy == txnReq[y]
+        <4>3. /\ Static(rqy, txnProg[y])
+              /\ rqy.type = "NewOrder" =>
+                    \E o \in OIds :
+                        /\ NOStatic(rqy, txnProg[y], o)
+                        /\ (y \in RunIds(runningTxns) /\ ~Doomed(h, txnProg, y)) =>
+                              dataStore[NK(rqy.w, rqy.d)] = o
+          BY <4>2 DEF BodyInv
+        <4>4. k \in RNWB(B) /\ req.type \in UpdTypes
+          BY <3>3, <1>6
+        <4>5. PICK wop \in txnProg[y].writes : wop.key = k
+          BY <3>3, <4>2, <1>6 DEF KW, KWB
+        <4>6. CASE req.type \in {"NewOrder", "Payment"}
+          <5>1. k.col \in {"tax", "info"}
+            BY <4>4, <4>6, <1>9 DEF Static
+          <5>2. wop.key.col \notin {"tax", "info"}
+            BY <4>3 DEF Static
+          <5> QED
+            BY <4>5, <5>1, <5>2
+        <4>7. CASE req.type = "Delivery"
+          <5>1. /\ k.tbl \in {"ORDER", "ORDERLINE"} /\ k.col \in {"hdr", "items"}
+                /\ k.w \in WIds /\ k.d \in DIds /\ k.o \in OIds
+                /\ k.o < dataStore[NK(k.w, k.d)]
+            BY <4>4, <4>7, <1>9 DEF Static, DelDyn
+          <5>2. CASE rqy.type = "NewOrder"
+            <6>1. PICK o \in OIds :
+                     /\ NOStatic(rqy, txnProg[y], o)
+                     /\ (y \in RunIds(runningTxns) /\ ~Doomed(h, txnProg, y)) =>
+                           dataStore[NK(rqy.w, rqy.d)] = o
+              BY <5>2, <4>3
+            <6>2. wop.key.w = rqy.w /\ wop.key.d = rqy.d /\ wop.key.o = o
+              BY <6>1, <5>1, <4>5 DEF NOStatic
+            <6>3. Doomed(h, txnProg, y)
+              BY <6>1, <6>2, <5>1, <4>1, <4>5
+            <6> QED
+              BY <6>3, <4>2, <1>7
+          <5>3. CASE rqy.type # "NewOrder"
+            <6>1. ~(wop.key.tbl \in {"ORDER", "ORDERLINE"} /\ wop.key.col \in {"hdr", "items"})
+              BY <5>3, <4>3 DEF Static
+            <6> QED
+              BY <6>1, <5>1, <4>5
+          <5> QED
+            BY <5>2, <5>3
+        <4> QED
+          BY <4>4, <4>6, <4>7 DEF UpdTypes
+      <3> QED
+        BY <3>1, <3>2, <3>3
+    <2>2. \A t1 \in RunIds(runningTxns') : txnReq'[t1].type \in UpdTypes =>
+             \A k \in RNWB(txnProg'[t1]) : \A y \in TxnIds :
+                 (Committed(h', y) /\ k \in KW(txnProg', y)) =>
+                     CT(h', y) < BT(h', t1)
+      <3> SUFFICES ASSUME NEW t1 \in RunIds(runningTxns'), txnReq'[t1].type \in UpdTypes,
+                          NEW k \in RNWB(txnProg'[t1]), NEW y \in TxnIds,
+                          Committed(h', y), k \in KW(txnProg', y)
+                   PROVE  CT(h', y) < BT(h', t1)
+        OBVIOUS
+      <3>1. Committed(h, y) /\ Started(h, y) /\ y # tid
+        BY <1>3, <1>a DEF Committed, Started
+      <3>2. CT(h', y) = CT(h, y) /\ CT(h, y) \in Nat /\ CT(h, y) =< clock
+        BY <3>1, <1>5, CommittedFacts
+      <3>3. CASE t1 = tid
+        BY <3>2, <3>3, <1>4 DEF TypeInv
+      <3>4. CASE t1 # tid
+        <4>1. t1 \in RunIds(runningTxns) /\ Started(h, t1) /\ t1 \in TxnIds
+          BY <3>4, <1>8, RunningFacts
+        <4>2. CT(h, y) < BT(h, t1)
+          BY <3>1, <3>4, <4>1, <1>6 DEF SafeInv
+        <4> QED
+          BY <4>1, <4>2, <3>2, <1>4
+      <3> QED
+        BY <3>3, <3>4
+    <2> QED
+      BY <2>1, <2>2 DEF SafeInv
+  <1>16. RWInv'
+    <2> SUFFICES ASSUME NEW t1 \in TxnIds, NEW t2 \in TxnIds,
+                        Committed(h', t1), Committed(h', t2), t1 # t2,
+                        KW(txnProg', t1) # {},
+                        \E k \in KW(txnProg', t2) : k \in txnProg'[t1].reads,
+                        BT(h', t1) < CT(h', t2)
+                 PROVE  CT(h', t1) < CT(h', t2)
+      BY DEF RWInv
+    <2>1. Committed(h, t1) /\ Committed(h, t2) /\ Started(h, t1) /\ Started(h, t2)
+      BY <1>3 DEF Committed, Started
+    <2>2. t1 # tid /\ t2 # tid
+      BY <2>1, <1>a
+    <2>3. /\ KW(txnProg', t1) = KW(txnProg, t1) /\ KW(txnProg', t2) = KW(txnProg, t2)
+          /\ txnProg'[t1] = txnProg[t1]
+      BY <2>2, <1>6
+    <2>4. BT(h', t1) = BT(h, t1) /\ CT(h', t1) = CT(h, t1) /\ CT(h', t2) = CT(h, t2)
+      BY <2>1, <1>4, <1>5
+    <2> QED
+      BY <2>1, <2>3, <2>4 DEF RWInv
+  <1> QED
+    BY <1>10, <1>11, <1>12, <1>13, <1>14, <1>15, <1>16
 
------------------------------------------------------------------------------
-(*****************************************************************************)
-(* 11. CommitTxn                                                             *)
-(*****************************************************************************)
+----------------------------------------------------------------------------
+(***************************************************************************)
+(* CommitTxn preserves the invariant.                                      *)
+(***************************************************************************)
 
-LEMMA TimesInjective ==
-  ASSUME Inv,
-         NEW op1 \in Range(txnHistory), NEW op2 \in Range(txnHistory),
-         op1.type \in {"begin", "commit", "abort"},
-         op2.type \in {"begin", "commit", "abort"},
-         op1.time = op2.time
-  PROVE  op1 = op2
-<1>1. PICK i \in DOMAIN txnHistory : txnHistory[i] = op1
-  BY DEF Range
-<1>2. PICK j \in DOMAIN txnHistory : txnHistory[j] = op2
-  BY DEF Range
-<1>3. CASE i = j
-  BY <1>1, <1>2, <1>3
-<1>4. CASE i < j
-  <2>1. op1.time < op2.time
-    BY <1>1, <1>2, <1>4 DEF Inv, TimesMono
-  <2>. QED
-    BY <2>1
-<1>5. CASE j < i
-  <2>1. op2.time < op1.time
-    BY <1>1, <1>2, <1>5 DEF Inv, TimesMono
-  <2>. QED
-    BY <2>1
-<1>6. PICK S : txnHistory \in Seq(S)
-  BY DEF Inv, HistSeq
-<1>7. i \in 1..Len(txnHistory) /\ j \in 1..Len(txnHistory)
-  BY <1>1, <1>2, <1>6, LenProperties
-<1>8. Len(txnHistory) \in Nat
-  BY <1>6, LenProperties
-<1>. QED
-  BY <1>3, <1>4, <1>5, <1>7, <1>8
-
-LEMMA RunningHasBeginBody ==
-  ASSUME Inv, NEW txn \in runningTxns
-  PROVE  /\ \E b \in Range(txnHistory) : b.type = "begin" /\ b.txnId = txn.id /\ b.time = txn.startTime
-         /\ \E d \in Range(txnHistory) : d.type = "body" /\ d.txnId = txn.id
-         /\ ~\E c \in Range(txnHistory) : c.type \in {"commit", "abort"} /\ c.txnId = txn.id
-BY DEF Inv, RunningOK
-
-LEMMA CommitInv ==
-  ASSUME Inv, NEW tid \in TxnIds, CommitTxn(tid)
-  PROVE  Inv'
-<1>1. PICK commitOp :
-        /\ commitOp = [type |-> "commit", txnId |-> tid, time |-> clock + 1,
-                       updatedKeys |-> SI!KeysWrittenByTxn(txnHistory, tid)]
-        /\ txnHistory' = Append(txnHistory, commitOp)
+THEOREM CommitStep ==
+    ASSUME Inv, NEW tid \in TxnIds, CommitTxn(tid)
+    PROVE  Inv'
+  <1> DEFINE h == txnHistory
+             P == txnProg
+             KWT == KW(txnProg, tid)
+             cop == [type |-> "commit", txnId |-> tid, time |-> clock + 1, updatedKeys |-> KWT]
+             rq0 == txnReq[tid]
+  <1> USE DEF Inv
+  <1>a. /\ tid \in RunIds(runningTxns)
+        /\ Started(h, tid) /\ ~Committed(h, tid) /\ ~Aborted(h, tid)
+        /\ \E r \in runningTxns : r.id = tid /\ r.startTime = BT(h, tid)
+        /\ BT(h, tid) \in Nat /\ BT(h, tid) =< clock
+    <2>1. tid \in RunIds(runningTxns)
+      BY DEF CommitTxn, SI!CommitTxn, SI!RunningTxnIds, RunIds
+    <2> QED
+      BY <2>1, RunningFacts, StartedFacts
+  <1>b. SI!KeysWrittenByTxn(h, tid) = KWT
+    <2>1. PICK bo \in Ops(h) : bo.txnId = tid /\ bo.type = "body"
+      BY <1>a, StartedFacts
+    <2>2. BodyMatch(h, txnProg)
+      BY DEF HistInv, BodyMatch
+    <2> QED
+      BY <2>1, <2>2, HistKeys
+  <1>0. /\ SI!TxnCanCommit(tid)
+        /\ txnHistory' = Append(h, cop)
+        /\ dataStore' = [k \in Keys |-> IF k \in KWT THEN WV(txnProg[tid], k) ELSE dataStore[k]]
         /\ runningTxns' = {r \in runningTxns : r.id # tid}
         /\ clock' = clock + 1
         /\ UNCHANGED <<txnSnapshots, txnProg, txnReq>>
-  BY DEF CommitTxn, SI!CommitTxn
-<1>2. PICK S : txnHistory \in Seq(S)
-  BY DEF Inv, HistSeq
-<1>3. txnHistory' \in Seq(S \cup {commitOp})
-  BY <1>1, <1>2, HistSeqAppend
-<1>4. Range(txnHistory') = Range(txnHistory) \cup {commitOp}
-  BY <1>1, <1>2, RangeAppend
-<1>5. commitOp.type = "commit" /\ commitOp.txnId = tid /\ commitOp.time = clock + 1
-      /\ commitOp.updatedKeys = SI!KeysWrittenByTxn(txnHistory, tid)
-  BY <1>1
-<1>6. clock \in Nat
-  BY DEF Inv, ClockType
-<1>7. tid \in SI!RunningTxnIds
-  BY DEF CommitTxn, SI!CommitTxn
-<1>8. PICK rtxn \in runningTxns : rtxn.id = tid
-  BY <1>7 DEF SI!RunningTxnIds
-<1>9. \E b \in Range(txnHistory) : b.type = "begin" /\ b.txnId = tid /\ b.time = rtxn.startTime
-      /\ \E d \in Range(txnHistory) : d.type = "body" /\ d.txnId = tid
-      /\ ~\E c \in Range(txnHistory) : c.type \in {"commit", "abort"} /\ c.txnId = tid
-  BY <1>8, RunningHasBeginBody
-<1>10. SI!TxnCanCommit(tid)
-  BY DEF CommitTxn, SI!CommitTxn
-<1>11. ~\E op \in Range(txnHistory) :
-          /\ op.type = "commit"
-          /\ op.time > rtxn.startTime
-          /\ SI!KeysWrittenByTxn(txnHistory, tid) \cap op.updatedKeys /= {}
-  <2>1. PICK txn \in runningTxns :
-          /\ txn.id = tid
-          /\ ~\E op \in SI!Range(txnHistory) :
-                /\ op.type = "commit"
-                /\ op.time > txn.startTime
-                /\ SI!KeysWrittenByTxn(txnHistory, tid) \cap op.updatedKeys /= {}
-    BY <1>10 DEF SI!TxnCanCommit
-  <2>2. txn = rtxn
-    BY <1>8, <2>1 DEF Inv, RunningOK
-  <2>. QED
-    BY <2>1, <2>2, RangeEq
-<1>12. HistSeq'
-  BY <1>3 DEF HistSeq
-<1>13. ClockType'
-  BY <1>1, <1>6 DEF ClockType
-<1>14. OpShape'
-  <2> SUFFICES ASSUME NEW op \in Range(txnHistory')
-               PROVE  /\ "type" \in DOMAIN op
-                      /\ "txnId" \in DOMAIN op
-                      /\ op.txnId \in TxnIds
-                      /\ op.type \in {"begin", "body", "commit", "abort"}
-                      /\ op.type \in {"begin", "commit", "abort"} =>
-                           "time" \in DOMAIN op /\ op.time \in Nat
-                      /\ op.type = "body" =>
-                           /\ "reads" \in DOMAIN op
-                           /\ "writes" \in DOMAIN op
-                           /\ \A w \in op.writes : "key" \in DOMAIN w
-                      /\ op.type = "commit" => "updatedKeys" \in DOMAIN op
-    BY DEF OpShape
-  <2>1. CASE op \in Range(txnHistory)
-    BY <2>1 DEF Inv, OpShape
-  <2>2. CASE op = commitOp
-    <3>1. "type" \in DOMAIN commitOp /\ "txnId" \in DOMAIN commitOp
-          /\ "time" \in DOMAIN commitOp /\ "updatedKeys" \in DOMAIN commitOp
-      BY <1>1
-    <3>2. commitOp.txnId \in TxnIds
-      BY <1>5
-    <3>3. commitOp.time \in Nat
-      BY <1>5, <1>6
-    <3>. QED
-      BY <2>2, <1>5, <3>1, <3>2, <3>3
-  <2>. QED
-    BY <1>4, <2>1, <2>2
-<1>15. UniqueOps'
-  <2> SUFFICES ASSUME NEW i \in DOMAIN txnHistory', NEW j \in DOMAIN txnHistory',
-                      txnHistory'[i].type = txnHistory'[j].type,
-                      txnHistory'[i].txnId = txnHistory'[j].txnId
-               PROVE  i = j
-    BY DEF UniqueOps
-  <2>1. DOMAIN txnHistory' = 1..(Len(txnHistory)+1)
-    BY <1>1, <1>2, AppendProperties, LenProperties
-  <2>2. DOMAIN txnHistory = 1..Len(txnHistory)
-    BY <1>2, LenProperties
-  <2>3. \A ii \in DOMAIN txnHistory : txnHistory'[ii] = txnHistory[ii]
-    BY <1>1, <1>2, AppendProperties
-  <2>4. txnHistory'[Len(txnHistory)+1] = commitOp
-    BY <1>1, <1>2, AppendProperties, LenProperties
-  <2>5. CASE i \in DOMAIN txnHistory /\ j \in DOMAIN txnHistory
-    BY <2>3, <2>5 DEF Inv, UniqueOps
-  <2>6. CASE i = Len(txnHistory)+1
-    <3>1. txnHistory'[i].type = "commit" /\ txnHistory'[i].txnId = tid
-      BY <2>4, <2>6, <1>5
-    <3>2. CASE j \in DOMAIN txnHistory
-      <4>1. txnHistory'[j] = txnHistory[j]
-        BY <2>3, <3>2
-      <4>2. txnHistory[j] \in Range(txnHistory)
-        BY <3>2 DEF Range
-      <4>3. txnHistory[j].type = "commit" /\ txnHistory[j].txnId = tid
-        BY <3>1, <4>1
-      <4>. QED
-        BY <1>9, <4>2, <4>3
-    <3>3. CASE j = Len(txnHistory)+1
-      BY <2>6, <3>3
-    <3>. QED
-      BY <2>1, <2>2, <3>2, <3>3
-  <2>7. CASE j = Len(txnHistory)+1
-    <3>1. CASE i \in DOMAIN txnHistory
-      <4>1. txnHistory'[j].type = "commit" /\ txnHistory'[j].txnId = tid
-        BY <2>4, <2>7, <1>5
-      <4>2. txnHistory'[i] = txnHistory[i]
-        BY <2>3, <3>1
-      <4>3. txnHistory[i] \in Range(txnHistory)
-        BY <3>1 DEF Range
-      <4>4. txnHistory[i].type = "commit" /\ txnHistory[i].txnId = tid
-        BY <4>1, <4>2
-      <4>. QED
-        BY <1>9, <4>3, <4>4
-    <3>2. CASE i = Len(txnHistory)+1
-      BY <2>7, <3>2
-    <3>. QED
-      BY <2>1, <2>2, <3>1, <3>2
-  <2>. QED
-    BY <2>1, <2>2, <2>5, <2>6, <2>7
-<1>16. TimesMono'
-  <2> SUFFICES ASSUME NEW i \in DOMAIN txnHistory', NEW j \in DOMAIN txnHistory',
-                      i < j,
-                      txnHistory'[i].type \in {"begin", "commit", "abort"},
-                      txnHistory'[j].type \in {"begin", "commit", "abort"}
-               PROVE  txnHistory'[i].time < txnHistory'[j].time
-    BY DEF TimesMono
-  <2>1. \A ii \in DOMAIN txnHistory : txnHistory'[ii] = txnHistory[ii]
-    BY <1>1, <1>2, AppendProperties
-  <2>2. CASE j \in DOMAIN txnHistory
-    <3>1. i \in DOMAIN txnHistory
-      BY <1>1, <1>2, <2>2, AppendProperties, LenProperties
-    <3>. QED
-      BY <2>1, <3>1, <2>2 DEF Inv, TimesMono
-  <2>3. CASE j = Len(txnHistory)+1
-    <3>1. i \in DOMAIN txnHistory
-      BY <2>3, <1>2, LenProperties
-    <3>2. txnHistory'[i] = txnHistory[i]
-      BY <2>1, <3>1
-    <3>3. txnHistory[i] \in Range(txnHistory)
-      BY <3>1 DEF Range
-    <3>4. txnHistory[i].time <= clock
-      BY <3>2, <3>3 DEF Inv, TimesVsClock, OpShape
-    <3>5. txnHistory[i].time \in Nat
-      BY <3>2, <3>3 DEF Inv, OpShape
-    <3>6. txnHistory'[j] = commitOp
-      BY <1>1, <1>2, <2>3, AppendProperties, LenProperties
-    <3>. QED
-      BY <3>2, <3>4, <3>5, <3>6, <1>5, <1>6
-  <2>. QED
-    BY <1>1, <1>2, <2>2, <2>3, AppendProperties, LenProperties
-<1>17. TimesVsClock'
-  <2> SUFFICES ASSUME NEW op \in Range(txnHistory'),
-                      op.type \in {"begin", "commit", "abort"}
-               PROVE  op.time <= clock'
-    BY DEF TimesVsClock
-  <2>1. CASE op \in Range(txnHistory)
-    <3>1. op.time <= clock
-      BY <2>1 DEF Inv, TimesVsClock
-    <3>2. op.time \in Nat
-      BY <2>1 DEF Inv, OpShape
-    <3>. QED
-      BY <1>1, <1>6, <3>1, <3>2
-  <2>2. CASE op = commitOp
-    BY <1>1, <1>5, <1>6, <2>2
-  <2>. QED
-    BY <1>4, <2>1, <2>2
-<1>18. OrderOK'
-  <2>1. \A ii \in DOMAIN txnHistory : txnHistory'[ii] = txnHistory[ii]
-    BY <1>1, <1>2, AppendProperties
-  <2>2. txnHistory'[Len(txnHistory)+1] = commitOp
-    BY <1>1, <1>2, AppendProperties, LenProperties
-  <2>3. \A i, j \in DOMAIN txnHistory' :
-           txnHistory'[i].txnId = txnHistory'[j].txnId
-           /\ txnHistory'[i].type = "begin"
-           /\ txnHistory'[j].type \in {"body", "commit", "abort"}
-           => i < j
-    <3> SUFFICES ASSUME NEW i \in DOMAIN txnHistory', NEW j \in DOMAIN txnHistory',
-                        txnHistory'[i].txnId = txnHistory'[j].txnId,
-                        txnHistory'[i].type = "begin",
-                        txnHistory'[j].type \in {"body", "commit", "abort"}
-                 PROVE  i < j
+    <2>1. \A k \in KWT : txnSnapshots[tid][k] = WV(txnProg[tid], k)
+      BY <1>a DEF SnapInv
+    <2> QED
+      BY <1>b, <2>1 DEF CommitTxn, SI!CommitTxn
+  <1>1. Ops(h') = Ops(h) \cup {cop} /\ h' \in Seq(Ops(h'))
+    <2>1. h \in Seq(Ops(h))
+      BY DEF TypeInv
+    <2>2. Ops(Append(h, cop)) = Ops(h) \cup {cop} /\ Append(h, cop) \in Seq(Ops(h) \cup {cop})
+      BY <2>1, RangeAppend
+    <2> QED
+      BY <2>2, <1>0
+  <1>2. UniqueOps(h')
+    <2> SUFFICES ASSUME NEW op1 \in Ops(h'), NEW op2 \in Ops(h'),
+                        op1.txnId = op2.txnId, op1.type = op2.type
+                 PROVE  op1 = op2
+      BY DEF UniqueOps
+    <2>1. CASE op1 \in Ops(h) /\ op2 \in Ops(h)
+      BY <2>1 DEF HistInv
+    <2>2. CASE op1 \in Ops(h) /\ op2 \notin Ops(h)
+      BY <2>2, <1>a, <1>1 DEF Committed
+    <2>3. CASE op1 \notin Ops(h) /\ op2 \in Ops(h)
+      BY <2>3, <1>a, <1>1 DEF Committed
+    <2>4. CASE op1 \notin Ops(h) /\ op2 \notin Ops(h)
+      BY <2>4, <1>1
+    <2> QED
+      BY <2>1, <2>2, <2>3, <2>4
+  <1>3. /\ \A t : Started(h', t) <=> Started(h, t)
+        /\ \A t : Committed(h', t) <=> (Committed(h, t) \/ t = tid)
+        /\ \A t : Aborted(h', t) <=> Aborted(h, t)
+    <2>1. \A t : Started(h', t) <=> Started(h, t)
+      BY <1>1, <1>a DEF Started
+    <2>2. \A t : Committed(h', t) <=> (Committed(h, t) \/ t = tid)
+      BY <1>1 DEF Committed
+    <2>3. \A t : Aborted(h', t) <=> Aborted(h, t)
+      BY <1>1 DEF Aborted
+    <2> QED
+      BY <2>1, <2>2, <2>3
+  <1>4. \A t : Started(h, t) => BT(h', t) = BT(h, t)
+    <2> SUFFICES ASSUME NEW t, Started(h, t) PROVE BT(h', t) = BT(h, t)
       OBVIOUS
-    <3>1. CASE i \in DOMAIN txnHistory /\ j \in DOMAIN txnHistory
-      BY <2>1, <3>1 DEF Inv, OrderOK
-    <3>2. CASE j = Len(txnHistory)+1
-      <4>0. i # Len(txnHistory)+1
-        BY <1>5, <2>2, <3>2
-      <4>1. i \in DOMAIN txnHistory
-        BY <1>1, <1>2, <3>2, <4>0, AppendProperties, LenProperties
-      <4>2. Len(txnHistory) \in Nat
-        BY <1>2, LenProperties
-      <4>. QED
-        BY <4>1, <3>2, <4>2
-    <3>3. CASE i = Len(txnHistory)+1
-      BY <1>5, <2>2, <3>3
-    <3>. QED
-      BY <1>1, <1>2, <3>1, <3>2, <3>3, AppendProperties, LenProperties
-  <2>4. \A i, j \in DOMAIN txnHistory' :
-           txnHistory'[i].txnId = txnHistory'[j].txnId
-           /\ txnHistory'[i].type = "body"
-           /\ txnHistory'[j].type \in {"commit", "abort"}
-           => i < j
-    <3> SUFFICES ASSUME NEW i \in DOMAIN txnHistory', NEW j \in DOMAIN txnHistory',
-                        txnHistory'[i].txnId = txnHistory'[j].txnId,
-                        txnHistory'[i].type = "body",
-                        txnHistory'[j].type \in {"commit", "abort"}
-                 PROVE  i < j
+    <2>1. PICK b \in Ops(h) : b.txnId = t /\ b.type = "begin" /\ b.time = BT(h, t)
+      BY StartedFacts
+    <2> QED
+      BY <2>1, <1>1, <1>2, ExtendTimes
+  <1>5. /\ \A t : Committed(h, t) => CT(h', t) = CT(h, t)
+        /\ CT(h', tid) = clock + 1
+    <2>1. ASSUME NEW t, Committed(h, t) PROVE CT(h', t) = CT(h, t)
+      <3>1. PICK c \in Ops(h) : c.txnId = t /\ c.type = "commit"
+        BY <2>1 DEF Committed
+      <3>2. CT(h, t) = c.time
+        BY <3>1, CTVal DEF HistInv, UniqueOps
+      <3> QED
+        BY <3>1, <3>2, <1>1, <1>2, ExtendTimes
+    <2>2. CT(h', tid) = clock + 1
+      <3>1. cop \in Ops(h') /\ cop.type = "commit" /\ cop.txnId = tid
+        BY <1>1
+      <3> QED
+        BY <3>1, <1>2, CTVal
+    <2> QED
+      BY <2>1, <2>2
+  <1>6. ~Doomed(h, txnProg, tid)
+    <2>1. PICK r \in runningTxns :
+             /\ r.id = tid
+             /\ ~\E op \in SI!Range(h) :
+                   /\ op.type = "commit"
+                   /\ op.time > r.startTime
+                   /\ SI!KeysWrittenByTxn(h, tid) \cap op.updatedKeys # {}
+      BY <1>0 DEF SI!TxnCanCommit
+    <2>2. r.startTime = BT(h, tid)
+      BY <2>1 DEF HistInv
+    <2> QED
+      BY <2>1, <2>2, <1>b DEF Doomed, KW, Ops
+  <1>7. \A t : Started(h, t) =>
+           /\ Doomed(h, txnProg, t) => Doomed(h', txnProg', t)
+           /\ ~Doomed(h', txnProg', t) => (~Doomed(h, txnProg, t) /\ KW(txnProg, t) \cap KWT = {})
+    <2> SUFFICES ASSUME NEW t, Started(h, t)
+                 PROVE  /\ Doomed(h, txnProg, t) => Doomed(h', txnProg', t)
+                        /\ ~Doomed(h', txnProg', t) => (~Doomed(h, txnProg, t) /\ KW(txnProg, t) \cap KWT = {})
       OBVIOUS
-    <3>1. CASE i \in DOMAIN txnHistory /\ j \in DOMAIN txnHistory
-      BY <2>1, <3>1 DEF Inv, OrderOK
-    <3>2. CASE j = Len(txnHistory)+1
-      <4>0. i # Len(txnHistory)+1
-        BY <1>5, <2>2, <3>2
-      <4>1. i \in DOMAIN txnHistory
-        BY <1>1, <1>2, <3>2, <4>0, AppendProperties, LenProperties
-      <4>2. Len(txnHistory) \in Nat
-        BY <1>2, LenProperties
-      <4>. QED
-        BY <4>1, <3>2, <4>2
-    <3>3. CASE i = Len(txnHistory)+1
-      BY <1>5, <2>2, <3>3
-    <3>. QED
-      BY <1>1, <1>2, <3>1, <3>2, <3>3, AppendProperties, LenProperties
-  <2>. QED
-    BY <2>3, <2>4 DEF OrderOK
-<1>19. CommitHasPreds'
-  <2> SUFFICES ASSUME NEW c \in Range(txnHistory'), c.type = "commit"
-               PROVE  /\ \E b \in Range(txnHistory') : b.type = "begin" /\ b.txnId = c.txnId
-                      /\ \E d \in Range(txnHistory') : d.type = "body"  /\ d.txnId = c.txnId
-    BY DEF CommitHasPreds
-  <2>1. CASE c \in Range(txnHistory)
-    BY <1>4, <2>1 DEF Inv, CommitHasPreds
-  <2>2. CASE c = commitOp
-    BY <1>4, <1>5, <1>9, <2>2
-  <2>. QED
-    BY <1>4, <2>1, <2>2
-<1>20. AbortHasPreds'
-  <2> SUFFICES ASSUME NEW a \in Range(txnHistory'), a.type = "abort"
-               PROVE  /\ \E b \in Range(txnHistory') : b.type = "begin" /\ b.txnId = a.txnId
-                      /\ \E d \in Range(txnHistory') : d.type = "body"  /\ d.txnId = a.txnId
-    BY DEF AbortHasPreds
-  <2>1. a \in Range(txnHistory)
-    BY <1>4, <1>5
-  <2>. QED
-    BY <1>4, <2>1 DEF Inv, AbortHasPreds
-<1>21. H1inv'
-  <2> SUFFICES ASSUME NEW b \in Range(txnHistory'), NEW c \in Range(txnHistory'),
-                      b.type = "begin", c.type = "commit", b.txnId = c.txnId
-               PROVE  b.time < c.time
-    BY DEF H1inv
-  <2>1. CASE c \in Range(txnHistory)
-    <3>1. b \in Range(txnHistory)
-      BY <1>4, <1>5, <2>1
-    <3>. QED
-      BY <2>1, <3>1 DEF Inv, H1inv
-  <2>2. CASE c = commitOp
-    <3>1. b \in Range(txnHistory)
-      BY <1>4, <1>5, <2>2
-    <3>2. b.txnId = tid
-      BY <1>5, <2>2
-    <3>3. b.time <= clock
-      BY <3>1 DEF Inv, TimesVsClock
-    <3>4. b.time \in Nat
-      BY <3>1 DEF Inv, OpShape
-    <3>. QED
-      BY <1>5, <1>6, <2>2, <3>3, <3>4
-  <2>. QED
-    BY <1>4, <2>1, <2>2
-<1>22. H2inv'
-  <2> SUFFICES ASSUME NEW d \in Range(txnHistory'), d.type = "body"
-               PROVE  BodyH2(d)
-    BY DEF H2inv
-  <2>1. d \in Range(txnHistory)
-    BY <1>4, <1>5
-  <2>. QED
-    BY <2>1 DEF Inv, H2inv
-<1>23. NoWriteROinv'
-  <2> SUFFICES ASSUME NEW op \in Range(txnHistory'), op.type = "body",
-                      NEW w \in op.writes
-               PROVE  ~ReadOnlyCol(w.key)
-    BY DEF NoWriteROinv, NoWriteRO
-  <2>1. op \in Range(txnHistory)
-    BY <1>4, <1>5
-  <2>. QED
-    BY <2>1 DEF Inv, NoWriteROinv, NoWriteRO
-<1>24. H3inv'
-  <2> SUFFICES ASSUME NEW c1 \in Range(txnHistory'), NEW c2 \in Range(txnHistory'),
-                      c1.type = "commit", c2.type = "commit",
-                      c1.txnId # c2.txnId,
-                      SI!KeysWrittenByTxn(txnHistory', c1.txnId)
-                        \cap SI!KeysWrittenByTxn(txnHistory', c2.txnId) # {},
-                      NEW b1 \in Range(txnHistory'), NEW b2 \in Range(txnHistory'),
-                      b1.type = "begin", b1.txnId = c1.txnId,
-                      b2.type = "begin", b2.txnId = c2.txnId
-               PROVE  c1.time < b2.time \/ c2.time < b1.time
-    BY DEF H3inv
-  <2>1. SI!KeysWrittenByTxn(txnHistory', c1.txnId) = SI!KeysWrittenByTxn(txnHistory, c1.txnId)
-    BY <1>1, <1>2, <1>5, KeysWrittenUnchangedNonBody
-  <2>2. SI!KeysWrittenByTxn(txnHistory', c2.txnId) = SI!KeysWrittenByTxn(txnHistory, c2.txnId)
-    BY <1>1, <1>2, <1>5, KeysWrittenUnchangedNonBody
-  <2>3. CASE c1 \in Range(txnHistory) /\ c2 \in Range(txnHistory)
-    <3>1. b1 \in Range(txnHistory) /\ b2 \in Range(txnHistory)
-      BY <1>4, <1>5
-    <3>. QED
-      BY <2>1, <2>2, <2>3, <3>1 DEF Inv, H3inv
-  <2>4. CASE c2 = commitOp
-    <3>1. c1 \in Range(txnHistory)
-      BY <1>4, <1>5, <2>4
-    <3>2. b2.txnId = tid
-      BY <1>5, <2>4
-    <3>3. b2 \in Range(txnHistory)
-      BY <1>4, <1>5
-    <3>4. b2.time = rtxn.startTime
-      BY <1>9, <3>2, <3>3, UniqueOpsRangeBegin DEF UniqueBegin
-    <3>5. c1.updatedKeys = SI!KeysWrittenByTxn(txnHistory, c1.txnId)
-      BY <3>1 DEF Inv, CommitKeys
-    <3>6. SI!KeysWrittenByTxn(txnHistory, tid) \cap c1.updatedKeys # {}
-      BY <2>1, <2>2, <1>5, <2>4, <3>5
-    <3>7. ~(c1.time > rtxn.startTime)
-      BY <1>11, <3>1, <3>6
-    <3>8. c1.time \in Nat /\ rtxn.startTime \in Nat
-      BY <1>8, <3>1 DEF Inv, OpShape, RunningOK
-    <3>9. c1.time <= rtxn.startTime
-      BY <3>7, <3>8
-    <3>10. c1.time # rtxn.startTime
-      <4>1. b2.type \in {"begin", "commit", "abort"} /\ c1.type \in {"begin", "commit", "abort"}
+    <2>1. BT(h', t) = BT(h, t) /\ BT(h, t) \in Nat /\ BT(h, t) =< clock
+      BY <1>4, StartedFacts
+    <2>2. Doomed(h, txnProg, t) => Doomed(h', txnProg', t)
+      BY <2>1, <1>0, <1>1 DEF Doomed
+    <2>3. KW(txnProg, t) \cap KWT # {} => Doomed(h', txnProg', t)
+      <3>1. cop \in Ops(h') /\ cop.time > BT(h', t)
+        BY <2>1, <1>1 DEF TypeInv
+      <3> QED
+        BY <3>1, <1>0 DEF Doomed
+    <2> QED
+      BY <2>2, <2>3
+  <1>8. RunIds(runningTxns') = RunIds(runningTxns) \ {tid}
+    BY <1>0 DEF RunIds
+  <1>9. /\ Static(rq0, txnProg[tid])
+        /\ rq0.type = "NewOrder" =>
+              \E o \in OIds :
+                  /\ NOStatic(rq0, txnProg[tid], o)
+                  /\ dataStore[NK(rq0.w, rq0.d)] = o
+    BY <1>a, <1>6 DEF BodyInv
+  <1>10. \A w \in WIds, d \in DIds :
+            /\ dataStore'[NK(w, d)] \in Nat
+            /\ dataStore[NK(w, d)] =< dataStore'[NK(w, d)]
+            /\ NK(w, d) \notin KWT => dataStore'[NK(w, d)] = dataStore[NK(w, d)]
+            /\ NK(w, d) \in KWT =>
+                  /\ rq0.type = "NewOrder" /\ w = rq0.w /\ d = rq0.d
+                  /\ dataStore'[NK(w, d)] = dataStore[NK(w, d)] + 1
+    <2> SUFFICES ASSUME NEW w \in WIds, NEW d \in DIds
+                 PROVE  /\ dataStore'[NK(w, d)] \in Nat
+                        /\ dataStore[NK(w, d)] =< dataStore'[NK(w, d)]
+                        /\ NK(w, d) \notin KWT => dataStore'[NK(w, d)] = dataStore[NK(w, d)]
+                        /\ NK(w, d) \in KWT =>
+                              /\ rq0.type = "NewOrder" /\ w = rq0.w /\ d = rq0.d
+                              /\ dataStore'[NK(w, d)] = dataStore[NK(w, d)] + 1
+      OBVIOUS
+    <2>0. NK(w, d) \in Keys /\ dataStore[NK(w, d)] \in Nat
+      BY NKInKeys DEF DataInv, DataInvS
+    <2>1. dataStore'[NK(w, d)] = IF NK(w, d) \in KWT THEN WV(txnProg[tid], NK(w, d)) ELSE dataStore[NK(w, d)]
+      BY <2>0, <1>0
+    <2>2. CASE NK(w, d) \notin KWT
+      BY <2>0, <2>1, <2>2
+    <2>3. CASE NK(w, d) \in KWT
+      <3>1. PICK wop \in txnProg[tid].writes : wop.key = NK(w, d)
+        BY <2>3 DEF KW, KWB
+      <3>2. rq0.type = "NewOrder"
+        <4>1. wop.key.tbl = "DIST" /\ wop.key.col = "nextoid"
+          BY <3>1, NKFields
+        <4> QED
+          BY <4>1, <1>9 DEF Static
+      <3>3. PICK o \in OIds : NOStatic(rq0, txnProg[tid], o) /\ dataStore[NK(rq0.w, rq0.d)] = o
+        BY <3>2, <1>9
+      <3>4. w = rq0.w /\ d = rq0.d
+        <4>1. NK(w, d) = NK(rq0.w, rq0.d)
+          BY <3>1, <3>3, NKFields DEF NOStatic
+        <4> QED
+          BY <4>1, NKInj
+      <3>5. WV(txnProg[tid], NK(w, d)) = o + 1
+        <4> DEFINE c == CHOOSE x \in txnProg[tid].writes : x.key = NK(w, d)
+        <4>1. c \in txnProg[tid].writes /\ c.key = NK(w, d)
+          BY <3>1
+        <4>2. c.val = o + 1
+          BY <4>1, <3>3, NKFields DEF NOStatic
+        <4> QED
+          BY <4>2 DEF WV
+      <3> QED
+        BY <2>1, <2>3, <3>2, <3>3, <3>4, <3>5, <2>0
+    <2> QED
+      BY <2>2, <2>3
+  <1>11. TypeInv'
+    BY <1>0, <1>1 DEF TypeInv
+  <1>12. HistInv'
+    <2>1. \A op \in Ops(h') :
+            /\ op.txnId \in TxnIds
+            /\ op.type \in {"begin", "body", "commit", "abort"}
+            /\ op.type = "body" => /\ op.reads  = txnProg'[op.txnId].reads
+                                   /\ op.writes = txnProg'[op.txnId].writes
+            /\ op.type \in {"begin", "commit", "abort"} => op.time \in Nat /\ op.time =< clock'
+            /\ op.type = "commit" => /\ op.updatedKeys = KW(txnProg', op.txnId)
+                                     /\ BT(h', op.txnId) < op.time
+      <3> SUFFICES ASSUME NEW op \in Ops(h') PROVE
+            /\ op.txnId \in TxnIds
+            /\ op.type \in {"begin", "body", "commit", "abort"}
+            /\ op.type = "body" => /\ op.reads  = txnProg'[op.txnId].reads
+                                   /\ op.writes = txnProg'[op.txnId].writes
+            /\ op.type \in {"begin", "commit", "abort"} => op.time \in Nat /\ op.time =< clock'
+            /\ op.type = "commit" => /\ op.updatedKeys = KW(txnProg', op.txnId)
+                                     /\ BT(h', op.txnId) < op.time
         OBVIOUS
-      <4>2. c1.time = b2.time => c1 = b2
-        BY <3>1, <3>3, <4>1, TimesInjective
-      <4>. QED
-        BY <3>1, <3>4, <4>2
-    <3>. QED
-      BY <3>4, <3>8, <3>9, <3>10
-  <2>5. CASE c1 = commitOp
-    <3>1. c2 \in Range(txnHistory)
-      BY <1>4, <1>5, <2>5
-    <3>2. b1.txnId = tid
-      BY <1>5, <2>5
-    <3>3. b1 \in Range(txnHistory)
-      BY <1>4, <1>5
-    <3>4. b1.time = rtxn.startTime
-      BY <1>9, <3>2, <3>3, UniqueOpsRangeBegin DEF UniqueBegin
-    <3>5. c2.updatedKeys = SI!KeysWrittenByTxn(txnHistory, c2.txnId)
-      BY <3>1 DEF Inv, CommitKeys
-    <3>6. SI!KeysWrittenByTxn(txnHistory, tid) \cap c2.updatedKeys # {}
-      BY <2>1, <2>2, <1>5, <2>5, <3>5
-    <3>7. ~(c2.time > rtxn.startTime)
-      BY <1>11, <3>1, <3>6
-    <3>8. c2.time \in Nat /\ rtxn.startTime \in Nat
-      BY <1>8, <3>1 DEF Inv, OpShape, RunningOK
-    <3>9. c2.time <= rtxn.startTime
-      BY <3>7, <3>8
-    <3>10. c2.time # rtxn.startTime
-      <4>1. b1.type \in {"begin", "commit", "abort"} /\ c2.type \in {"begin", "commit", "abort"}
+      <3>1. CASE op = cop
+        <4>1. BT(h', tid) = BT(h, tid)
+          BY <1>a, <1>4
+        <4>2. op.txnId = tid /\ op.type = "commit" /\ op.time = clock + 1 /\ op.updatedKeys = KWT
+          BY <3>1
+        <4>3. clock \in Nat /\ clock' = clock + 1 /\ txnProg' = txnProg
+          BY <1>0 DEF TypeInv
+        <4>4. op.time \in Nat /\ op.time =< clock' /\ BT(h', op.txnId) < op.time
+          BY <4>1, <4>2, <4>3, <1>a
+        <4>5. op.updatedKeys = KW(txnProg', op.txnId)
+          BY <4>2, <4>3
+        <4> QED
+          BY <4>2, <4>4, <4>5
+      <3>2. CASE op \in Ops(h)
+        <4>1. Started(h, op.txnId)
+          BY <3>2 DEF Started
+        <4>2. op.type \in {"begin", "commit", "abort"} => op.time \in Nat /\ op.time =< clock'
+          BY <3>2, <1>0 DEF HistInv, TypeInv
+        <4>3. op.type = "commit" => BT(h', op.txnId) < op.time
+          BY <3>2, <4>1, <1>4 DEF HistInv
+        <4> QED
+          BY <3>2, <4>2, <4>3, <1>0 DEF HistInv
+      <3> QED
+        BY <3>1, <3>2, <1>1
+    <2>2. \A t \in TxnIds : Started(h', t) =>
+            /\ \E op \in Ops(h') : op.txnId = t /\ op.type = "begin"
+            /\ \E op \in Ops(h') : op.txnId = t /\ op.type = "body"
+      BY <1>1, <1>3 DEF HistInv
+    <2>3. \A r \in runningTxns' :
+            /\ r.id \in TxnIds
+            /\ Started(h', r.id)
+            /\ r.startTime = BT(h', r.id)
+            /\ ~Committed(h', r.id)
+            /\ ~Aborted(h', r.id)
+      BY <1>0, <1>3, <1>4 DEF HistInv
+    <2> QED
+      BY <2>1, <2>2, <2>3, <1>2 DEF HistInv, UniqueOps
+  <1>13. SnapInv'
+    BY <1>0, <1>3 DEF SnapInv
+  <1>14. DataInv'
+    <2>1. \A w \in WIds, d \in DIds : dataStore'[NK(w, d)] \in Nat
+      BY <1>10
+    <2>2. ASSUME NEW w \in WIds, NEW d \in DIds, NEW o \in OIds,
+                 dataStore'[NOK(w, d, o)] # Empty
+          PROVE  o < dataStore'[NK(w, d)]
+      <3>0. NOK(w, d, o) \in Keys /\ dataStore[NK(w, d)] \in Nat /\ o \in Nat
+        BY NOKInKeys DEF DataInv, DataInvS, OIds
+      <3>1. dataStore'[NOK(w, d, o)] = IF NOK(w, d, o) \in KWT THEN WV(txnProg[tid], NOK(w, d, o)) ELSE dataStore[NOK(w, d, o)]
+        BY <3>0, <1>0
+      <3>2. CASE NOK(w, d, o) \notin KWT
+        <4>1. o < dataStore[NK(w, d)]
+          BY <3>1, <3>2, <2>2 DEF DataInv, DataInvS
+        <4> QED
+          BY <4>1, <3>0, <1>10
+      <3>3. CASE NOK(w, d, o) \in KWT
+        <4> DEFINE c == CHOOSE x \in txnProg[tid].writes : x.key = NOK(w, d, o)
+        <4>1. c \in txnProg[tid].writes /\ c.key = NOK(w, d, o)
+          BY <3>3 DEF KW, KWB
+        <4>2. dataStore'[NOK(w, d, o)] = c.val
+          BY <3>1, <3>3 DEF WV
+        <4>3. c.key.tbl = "NEWORDER" /\ c.key.w = w /\ c.key.d = d /\ c.key.o = o
+          BY <4>1, NOKFields
+        <4>4. rq0.type = "NewOrder"
+          <5> SUFFICES ASSUME rq0.type # "NewOrder" PROVE FALSE
+            OBVIOUS
+          <5>1. \A x \in txnProg[tid].writes : x.key.tbl = "NEWORDER" => x.val = Empty
+            BY <1>9 DEF Static
+          <5> QED
+            BY <5>1, <4>1, <4>2, <4>3, <2>2
+        <4>5. PICK oo \in OIds : NOStatic(rq0, txnProg[tid], oo) /\ dataStore[NK(rq0.w, rq0.d)] = oo
+          BY <4>4, <1>9
+        <4>6. w = rq0.w /\ d = rq0.d /\ o = oo
+          BY <4>1, <4>3, <4>5 DEF NOStatic
+        <4>7. NK(w, d) \in KWT
+          BY <4>5, <4>6 DEF NOStatic, KW
+        <4>8. dataStore'[NK(w, d)] = oo + 1
+          BY <4>5, <4>6, <4>7, <1>10
+        <4> QED
+          BY <4>6, <4>8, <3>0
+      <3> QED
+        BY <3>2, <3>3
+    <2> QED
+      BY <2>1, <2>2 DEF DataInv, DataInvS
+  <1>15. BodyInv'
+    <2> SUFFICES ASSUME NEW t \in TxnIds, Started(h', t)
+                 PROVE  /\ Static(txnReq'[t], txnProg'[t])
+                        /\ DelDyn(txnReq'[t], txnProg'[t], dataStore')
+                        /\ txnReq'[t].type = "NewOrder" =>
+                              \E o \in OIds :
+                                  /\ NOStatic(txnReq'[t], txnProg'[t], o)
+                                  /\ (t \in RunIds(runningTxns') /\ ~Doomed(h', txnProg', t)) =>
+                                        dataStore'[NK(txnReq'[t].w, txnReq'[t].d)] = o
+      BY DEF BodyInv
+    <2>1. Started(h, t)
+      BY <1>3
+    <2> DEFINE rq == txnReq[t]
+    <2>2. /\ Static(rq, txnProg[t])
+          /\ DelDyn(rq, txnProg[t], dataStore)
+          /\ rq.type = "NewOrder" =>
+                \E o \in OIds :
+                    /\ NOStatic(rq, txnProg[t], o)
+                    /\ (t \in RunIds(runningTxns) /\ ~Doomed(h, txnProg, t)) =>
+                          dataStore[NK(rq.w, rq.d)] = o
+      BY <2>1 DEF BodyInv
+    <2>3. DelDyn(rq, txnProg[t], dataStore')
+      <3> SUFFICES ASSUME rq.type = "Delivery", NEW k \in RNWB(txnProg[t])
+                   PROVE  k.o < dataStore'[NK(k.w, k.d)]
+        BY DEF DelDyn
+      <3>1. k.w \in WIds /\ k.d \in DIds /\ k.o \in OIds /\ k.o < dataStore[NK(k.w, k.d)]
+        BY <2>2 DEF Static, DelDyn
+      <3>2. dataStore[NK(k.w, k.d)] \in Nat /\ dataStore'[NK(k.w, k.d)] \in Nat
+            /\ dataStore[NK(k.w, k.d)] =< dataStore'[NK(k.w, k.d)]
+        BY <3>1, <1>10 DEF DataInv, DataInvS
+      <3> QED
+        BY <3>1, <3>2 DEF OIds
+    <2>4. rq.type = "NewOrder" =>
+             \E o \in OIds :
+                 /\ NOStatic(rq, txnProg[t], o)
+                 /\ (t \in RunIds(runningTxns') /\ ~Doomed(h', txnProg', t)) =>
+                       dataStore'[NK(rq.w, rq.d)] = o
+      <3> SUFFICES ASSUME rq.type = "NewOrder"
+                   PROVE  \E o \in OIds :
+                             /\ NOStatic(rq, txnProg[t], o)
+                             /\ (t \in RunIds(runningTxns') /\ ~Doomed(h', txnProg', t)) =>
+                                   dataStore'[NK(rq.w, rq.d)] = o
         OBVIOUS
-      <4>2. c2.time = b1.time => c2 = b1
-        BY <3>1, <3>3, <4>1, TimesInjective
-      <4>. QED
-        BY <3>1, <3>4, <4>2
-    <3>. QED
-      BY <3>4, <3>8, <3>9, <3>10
-  <2>. QED
-    BY <1>4, <2>3, <2>4, <2>5
-<1>25. CommitKeys'
-  <2> SUFFICES ASSUME NEW c \in Range(txnHistory'), c.type = "commit"
-               PROVE  c.updatedKeys = SI!KeysWrittenByTxn(txnHistory', c.txnId)
-    BY DEF CommitKeys
-  <2>1. SI!KeysWrittenByTxn(txnHistory', c.txnId) = SI!KeysWrittenByTxn(txnHistory, c.txnId)
-    BY <1>1, <1>2, <1>5, KeysWrittenUnchangedNonBody
-  <2>2. CASE c \in Range(txnHistory)
-    BY <2>1, <2>2 DEF Inv, CommitKeys
-  <2>3. CASE c = commitOp
-    BY <1>5, <2>1, <2>3
-  <2>. QED
-    BY <1>4, <2>2, <2>3
-<1>26. RunningOK'
-  <2>1. runningTxns' \subseteq [id : TxnIds, startTime : Nat, commitTime : {Empty}]
-    BY <1>1 DEF Inv, RunningOK
-  <2>2. \A txn \in runningTxns' :
-           /\ \E b \in Range(txnHistory') :
-                 b.type = "begin" /\ b.txnId = txn.id /\ b.time = txn.startTime
-           /\ \E d \in Range(txnHistory') : d.type = "body" /\ d.txnId = txn.id
-           /\ ~\E c \in Range(txnHistory') : c.type \in {"commit", "abort"} /\ c.txnId = txn.id
-    <3> SUFFICES ASSUME NEW txn \in runningTxns'
-                 PROVE  /\ \E b \in Range(txnHistory') :
-                              b.type = "begin" /\ b.txnId = txn.id /\ b.time = txn.startTime
-                        /\ \E d \in Range(txnHistory') : d.type = "body" /\ d.txnId = txn.id
-                        /\ ~\E c \in Range(txnHistory') : c.type \in {"commit", "abort"} /\ c.txnId = txn.id
-      OBVIOUS
-    <3>1. txn \in runningTxns /\ txn.id # tid
-      BY <1>1
-    <3>2. \E b \in Range(txnHistory) :
-            b.type = "begin" /\ b.txnId = txn.id /\ b.time = txn.startTime
-          /\ \E d \in Range(txnHistory) : d.type = "body" /\ d.txnId = txn.id
-          /\ ~\E c \in Range(txnHistory) : c.type \in {"commit", "abort"} /\ c.txnId = txn.id
-      BY <3>1, RunningHasBeginBody
-    <3>3. ~\E c \in Range(txnHistory') : c.type \in {"commit", "abort"} /\ c.txnId = txn.id
-      BY <1>4, <1>5, <3>1, <3>2
-    <3>. QED
-      BY <1>4, <3>2, <3>3
-  <2>3. \A t1, t2 \in runningTxns' : t1.id = t2.id => t1 = t2
-    BY <1>1 DEF Inv, RunningOK
-  <2>. QED
-    BY <2>1, <2>2, <2>3 DEF RunningOK
-<1>. QED
-  BY <1>12, <1>13, <1>14, <1>15, <1>16, <1>17, <1>18, <1>19, <1>20,
-     <1>21, <1>22, <1>23, <1>24, <1>25, <1>26
-  DEF Inv
+      <3>1. PICK o \in OIds :
+               /\ NOStatic(rq, txnProg[t], o)
+               /\ (t \in RunIds(runningTxns) /\ ~Doomed(h, txnProg, t)) =>
+                     dataStore[NK(rq.w, rq.d)] = o
+        BY <2>2
+      <3>2. ASSUME t \in RunIds(runningTxns'), ~Doomed(h', txnProg', t)
+            PROVE  dataStore'[NK(rq.w, rq.d)] = o
+        <4>1. t \in RunIds(runningTxns) /\ ~Doomed(h, txnProg, t) /\ KW(txnProg, t) \cap KWT = {}
+          BY <3>2, <2>1, <1>7, <1>8
+        <4>2. NK(rq.w, rq.d) \in KW(txnProg, t)
+          BY <3>1 DEF NOStatic, KW
+        <4>3. rq.w \in WIds /\ rq.d \in DIds
+          BY <2>2, ReqTypes DEF Static
+        <4> QED
+          BY <4>1, <4>2, <4>3, <3>1, <1>10
+      <3> QED
+        BY <3>1, <3>2
+    <2> QED
+      BY <2>2, <2>3, <2>4, <1>0
+  <1>16. SafeInv'
+    <2>1. \A t1 \in RunIds(runningTxns') : txnReq'[t1].type \in UpdTypes =>
+             \A k \in RNWB(txnProg'[t1]) : \A y \in RunIds(runningTxns') :
+                 (y # t1 /\ k \in KW(txnProg', y)) => Doomed(h', txnProg', y)
+      <3> SUFFICES ASSUME NEW t1 \in RunIds(runningTxns'), txnReq'[t1].type \in UpdTypes,
+                          NEW k \in RNWB(txnProg'[t1]), NEW y \in RunIds(runningTxns'),
+                          y # t1, k \in KW(txnProg', y)
+                   PROVE  Doomed(h', txnProg', y)
+        OBVIOUS
+      <3>1. t1 \in RunIds(runningTxns) /\ y \in RunIds(runningTxns)
+        BY <1>8
+      <3>2. Doomed(h, txnProg, y) /\ Started(h, y)
+        BY <3>1, <1>0, RunningFacts DEF SafeInv
+      <3> QED
+        BY <3>2, <1>7
+    <2>2. \A t1 \in RunIds(runningTxns') : txnReq'[t1].type \in UpdTypes =>
+             \A k \in RNWB(txnProg'[t1]) : \A y \in TxnIds :
+                 (Committed(h', y) /\ k \in KW(txnProg', y)) =>
+                     CT(h', y) < BT(h', t1)
+      <3> SUFFICES ASSUME NEW t1 \in RunIds(runningTxns'), txnReq'[t1].type \in UpdTypes,
+                          NEW k \in RNWB(txnProg'[t1]), NEW y \in TxnIds,
+                          Committed(h', y), k \in KW(txnProg', y)
+                   PROVE  CT(h', y) < BT(h', t1)
+        OBVIOUS
+      <3>1. t1 \in RunIds(runningTxns) /\ t1 # tid /\ Started(h, t1)
+        BY <1>8, RunningFacts
+      <3>2. CASE y = tid
+        <4>1. Doomed(h, txnProg, tid)
+          BY <3>1, <3>2, <1>a, <1>0 DEF SafeInv
+        <4> QED
+          BY <4>1, <1>6
+      <3>3. CASE y # tid
+        <4>1. Committed(h, y)
+          BY <3>3, <1>3
+        <4>2. CT(h, y) < BT(h, t1)
+          BY <4>1, <3>1, <1>0 DEF SafeInv
+        <4> QED
+          BY <4>1, <4>2, <3>1, <1>4, <1>5
+      <3> QED
+        BY <3>2, <3>3
+    <2> QED
+      BY <2>1, <2>2 DEF SafeInv
+  <1>17. RWInv'
+    <2> SUFFICES ASSUME NEW t1 \in TxnIds, NEW t2 \in TxnIds,
+                        Committed(h', t1), Committed(h', t2), t1 # t2,
+                        KW(txnProg', t1) # {},
+                        \E k \in KW(txnProg', t2) : k \in txnProg'[t1].reads,
+                        BT(h', t1) < CT(h', t2)
+                 PROVE  CT(h', t1) < CT(h', t2)
+      BY DEF RWInv
+    <2>1. CASE t1 # tid /\ t2 # tid
+      <3>1. Committed(h, t1) /\ Committed(h, t2) /\ Started(h, t1)
+        BY <2>1, <1>3 DEF Committed, Started
+      <3>2. BT(h', t1) = BT(h, t1) /\ CT(h', t1) = CT(h, t1) /\ CT(h', t2) = CT(h, t2)
+        BY <3>1, <1>4, <1>5
+      <3> QED
+        BY <3>1, <3>2, <1>0 DEF RWInv
+    <2>2. CASE t2 = tid
+      <3>1. Committed(h, t1)
+        BY <2>2, <1>3
+      <3>2. CT(h', t1) = CT(h, t1) /\ CT(h, t1) \in Nat /\ CT(h, t1) =< clock
+        BY <3>1, <1>5, CommittedFacts
+      <3> QED
+        BY <2>2, <3>2, <1>5 DEF TypeInv
+    <2>3. CASE t1 = tid
+      <3>1. Committed(h, t2) /\ t2 # tid
+        BY <2>3, <1>3
+      <3>2. PICK c2 \in Ops(h) : c2.txnId = t2 /\ c2.type = "commit"
+        BY <3>1 DEF Committed
+      <3>3. CT(h, t2) = c2.time /\ c2.updatedKeys = KW(txnProg, t2)
+        BY <3>2, CTVal DEF HistInv, UniqueOps
+      <3>4. BT(h, tid) < c2.time
+        BY <2>3, <3>1, <3>3, <1>a, <1>4, <1>5
+      <3>5. PICK k \in KW(txnProg, t2) : k \in txnProg[tid].reads
+        BY <2>3, <1>0
+      <3>6. CASE k \in KWT
+        <4>1. Doomed(h, txnProg, tid)
+          BY <3>2, <3>3, <3>4, <3>5, <3>6 DEF Doomed
+        <4> QED
+          BY <4>1, <1>6
+      <3>7. CASE k \notin KWT
+        <4>1. k \in RNWB(txnProg[tid])
+          BY <3>5, <3>7 DEF RNWB, KW, KWB
+        <4>2. rq0.type \in UpdTypes
+          <5>1. txnProg[tid].writes # {}
+            BY <2>3, <1>0 DEF KW, KWB
+          <5> QED
+            BY <5>1, <1>9 DEF Static
+        <4>3. CT(h, t2) < BT(h, tid)
+          BY <4>1, <4>2, <3>1, <3>5, <1>a DEF SafeInv
+        <4>4. c2.time \in Nat
+          BY <3>2 DEF HistInv
+        <4> QED
+          BY <4>3, <4>4, <3>3, <3>4, <1>a
+      <3> QED
+        BY <3>6, <3>7
+    <2> QED
+      BY <2>1, <2>2, <2>3
+  <1> QED
+    BY <1>11, <1>12, <1>13, <1>14, <1>15, <1>16, <1>17
 
------------------------------------------------------------------------------
-(*****************************************************************************)
-(* 12. StartAndRun                                                           *)
-(*****************************************************************************)
+----------------------------------------------------------------------------
+(***************************************************************************)
+(* The main theorem.                                                       *)
+(***************************************************************************)
 
-LEMMA ProgramWritesHaveKey ==
-  ASSUME NEW tid, NEW req \in Requests, NEW snap,
-         NEW w \in ProgramFor(tid, req, snap).writes
-  PROVE  "key" \in DOMAIN w
-<1>1. req.type \in {"NewOrder", "Payment", "StockLevel"}
-  BY RequestType
-<1>2. CASE req.type = "Payment"
-  <2>1. ProgramFor(tid, req, snap) = PaymentProgram(tid, req, snap)
-    BY <1>2, ProgramForPayment
-  <2>2. w \in WrOps(snap, WhKey(req.w), [ytd |-> Tag])
-        \/ w \in WrOps(snap, DistKey(req.w, req.d), [ytd |-> Tag])
-        \/ w \in WrOps(snap, CustKey(req.cw, req.cd, req.c), [balance |-> Tag])
-        \/ w \in WrOps(snap, HistKey(tid), [row |-> Tag])
-    BY <2>1 DEF PaymentProgram
-  <2>. QED
-    BY <2>2, WrOpsDef
-<1>3. CASE req.type = "StockLevel"
-  <2>1. ProgramFor(tid, req, snap) = StockLevelProgram(req, snap)
-    BY <1>3, ProgramForStockLevel
-  <2>2. StockLevelProgram(req, snap).writes = {}
-    BY DEF StockLevelProgram
-  <2>. QED
-    BY <2>1, <2>2
-<1>4. CASE req.type = "NewOrder"
-  <2> DEFINE B == NewOrderProgram(req, snap)
-             w0 == req.w
-             d == req.d
-             c == req.c
-             sw == req.sw
-             items == req.items
-             o == ColVal(snap, DistKey(w0, d), "nextoid")
-  <2>1. ProgramFor(tid, req, snap) = B
-    BY <1>4, ProgramForNewOrder
-  <2>2. B.writes = WrOps(snap, DistKey(w0, d), [nextoid |-> o + 1])
-                   \cup (UNION {WrOps(snap, StockKey(sw, i), [qty |-> Tag]) : i \in items})
-                   \cup WrOps(snap, OrderKey(w0, d, o), [hdr |-> c, carrier |-> Tag])
-                   \cup WrOps(snap, NewOrdKey(w0, d, o), [row |-> Tag])
-                   \cup WrOps(snap, OrdLineKey(w0, d, o), [items |-> items, delivery |-> Tag])
-    BY DEF NewOrderProgram
-  <2>3. w \in WrOps(snap, DistKey(w0, d), [nextoid |-> o + 1])
-        \/ w \in UNION {WrOps(snap, StockKey(sw, i), [qty |-> Tag]) : i \in items}
-        \/ w \in WrOps(snap, OrderKey(w0, d, o), [hdr |-> c, carrier |-> Tag])
-        \/ w \in WrOps(snap, NewOrdKey(w0, d, o), [row |-> Tag])
-        \/ w \in WrOps(snap, OrdLineKey(w0, d, o), [items |-> items, delivery |-> Tag])
-    BY <2>1, <2>2
-  <2>. QED
-    BY <2>3, WrOpsDef
-<1>. QED
-  BY <1>1, <1>2, <1>3, <1>4
+THEOREM NextInv ==
+    Inv /\ [Next]_vars => Inv'
+  <1> SUFFICES ASSUME Inv, [Next]_vars PROVE Inv'
+    OBVIOUS
+  <1>1. ASSUME NEW tid \in TxnIds, NEW req \in Requests, StartAndRun(tid, req) PROVE Inv'
+    BY <1>1, StartStep
+  <1>2. ASSUME NEW tid \in TxnIds, CommitTxn(tid) PROVE Inv'
+    BY <1>2, CommitStep
+  <1>3. ASSUME NEW tid \in TxnIds, AbortTxn(tid) PROVE Inv'
+    BY <1>3, AbortStep
+  <1>4. ASSUME UNCHANGED vars PROVE Inv'
+    BY <1>4 DEF vars, Inv, TypeInv, HistInv, SnapInv, DataInv, DataInvS, BodyInv, SafeInv, RWInv,
+                Ops, Started, Committed, Aborted, BT, CT, KW, Doomed, RunIds
+  <1> QED
+    BY <1>1, <1>2, <1>3, <1>4 DEF Next
 
-LEMMA StartInv ==
-  ASSUME Inv, NEW tid \in TxnIds, NEW req \in Requests, StartAndRun(tid, req)
-  PROVE  Inv'
-<1> DEFINE body == ProgramFor(tid, req, dataStore)
-           beginOp == [type |-> "begin", txnId |-> tid, time |-> clock + 1]
-           bodyOp == [type |-> "body", txnId |-> tid, reads |-> body.reads, writes |-> body.writes]
-           newTxn == [id |-> tid, startTime |-> clock + 1, commitTime |-> Empty]
-<1>1. /\ ~\E op \in SI!Range(txnHistory) : op.txnId = tid
-      /\ txnHistory' = txnHistory \o <<beginOp, bodyOp>>
-      /\ runningTxns' = runningTxns \cup {newTxn}
-      /\ clock' = clock + 1
-      /\ UNCHANGED dataStore
-  BY DEF StartAndRun, SI!StartAndRun
-<1>2. PICK S : txnHistory \in Seq(S)
-  BY DEF Inv, HistSeq
-<1>3. txnHistory' \in Seq(S \cup {beginOp, bodyOp})
-  BY <1>1, <1>2, HistSeqConcatPair
-<1>4. Range(txnHistory') = Range(txnHistory) \cup {beginOp, bodyOp}
-  BY <1>1, <1>2, RangeConcatPair
-<1>5. beginOp.type = "begin" /\ beginOp.txnId = tid /\ beginOp.time = clock + 1
-      /\ bodyOp.type = "body" /\ bodyOp.txnId = tid
-      /\ bodyOp.reads = body.reads /\ bodyOp.writes = body.writes
-  OBVIOUS
-<1>6. clock \in Nat
-  BY DEF Inv, ClockType
-<1>7. ~\E op \in Range(txnHistory) : op.txnId = tid
-  BY <1>1, RangeEq
-<1>8. BodyH2(body)
-  BY WorkloadH2
-<1>9. "reads" \in DOMAIN body /\ "writes" \in DOMAIN body
-  BY ProgramHasRW
-<1>10. HistSeq'
-  BY <1>3 DEF HistSeq
-<1>11. ClockType'
-  BY <1>1, <1>6 DEF ClockType
-<1>12. OpShape'
-  <2> SUFFICES ASSUME NEW op \in Range(txnHistory')
-               PROVE  /\ "type" \in DOMAIN op
-                      /\ "txnId" \in DOMAIN op
-                      /\ op.txnId \in TxnIds
-                      /\ op.type \in {"begin", "body", "commit", "abort"}
-                      /\ op.type \in {"begin", "commit", "abort"} =>
-                           "time" \in DOMAIN op /\ op.time \in Nat
-                      /\ op.type = "body" =>
-                           /\ "reads" \in DOMAIN op
-                           /\ "writes" \in DOMAIN op
-                           /\ \A w \in op.writes : "key" \in DOMAIN w
-                      /\ op.type = "commit" => "updatedKeys" \in DOMAIN op
-    BY DEF OpShape
-  <2>1. CASE op \in Range(txnHistory)
-    BY <2>1 DEF Inv, OpShape
-  <2>2. CASE op = beginOp
-    <3>1. "type" \in DOMAIN beginOp /\ "txnId" \in DOMAIN beginOp /\ "time" \in DOMAIN beginOp
-      OBVIOUS
-    <3>2. beginOp.time \in Nat
-      BY <1>5, <1>6
-    <3>. QED
-      BY <2>2, <1>5, <3>1, <3>2
-  <2>3. CASE op = bodyOp
-    <3>1. "type" \in DOMAIN bodyOp /\ "txnId" \in DOMAIN bodyOp
-          /\ "reads" \in DOMAIN bodyOp /\ "writes" \in DOMAIN bodyOp
-      BY <1>5, <1>9
-    <3>2. \A w \in bodyOp.writes : "key" \in DOMAIN w
-      BY <1>5, ProgramWritesHaveKey
-    <3>. QED
-      BY <2>3, <1>5, <3>1, <3>2
-  <2>. QED
-    BY <1>4, <2>1, <2>2, <2>3
-<1>13. UniqueOps'
-  <2> SUFFICES ASSUME NEW i \in DOMAIN txnHistory', NEW j \in DOMAIN txnHistory',
-                      txnHistory'[i].type = txnHistory'[j].type,
-                      txnHistory'[i].txnId = txnHistory'[j].txnId
-               PROVE  i = j
-    BY DEF UniqueOps
-  <2>1. DOMAIN txnHistory' = 1..(Len(txnHistory)+2)
-    BY <1>1, <1>2, <1>3, ConcatProperties, PairSeq, SeqMonotonic, LenProperties
-  <2>2. DOMAIN txnHistory = 1..Len(txnHistory)
-    BY <1>2, LenProperties
-  <2>3. Len(txnHistory) \in Nat
-    BY <1>2, LenProperties
-  <2>4. <<beginOp, bodyOp>> \in Seq(S \cup {beginOp, bodyOp})
-    BY PairSeq, SeqMonotonic
-  <2>5. \A ii \in DOMAIN txnHistory : txnHistory'[ii] = txnHistory[ii]
-    BY <1>1, <1>2, <2>4, ConcatProperties, LenProperties
-  <2>6. txnHistory'[Len(txnHistory)+1] = beginOp
-    BY <1>1, <1>2, <2>4, ConcatProperties, LenProperties
-  <2>7. txnHistory'[Len(txnHistory)+2] = bodyOp
-    BY <1>1, <1>2, <2>4, ConcatProperties, LenProperties
-  <2>8. CASE i \in DOMAIN txnHistory /\ j \in DOMAIN txnHistory
-    BY <2>5, <2>8 DEF Inv, UniqueOps
-  <2>9. CASE i \in {Len(txnHistory)+1, Len(txnHistory)+2} /\ j \in DOMAIN txnHistory
-    <3>1. txnHistory'[i].txnId = tid
-      BY <2>9, <1>5, <2>6, <2>7
-    <3>2. txnHistory'[j] = txnHistory[j]
-      BY <2>5, <2>9
-    <3>3. txnHistory[j] \in Range(txnHistory)
-      BY <2>2, <2>9 DEF Range
-    <3>4. txnHistory[j].txnId = tid
-      BY <3>1, <3>2
-    <3>. QED
-      BY <1>7, <3>3, <3>4
-  <2>10. CASE j \in {Len(txnHistory)+1, Len(txnHistory)+2} /\ i \in DOMAIN txnHistory
-    <3>1. txnHistory'[j].txnId = tid
-      BY <2>10, <1>5, <2>6, <2>7
-    <3>2. txnHistory'[i] = txnHistory[i]
-      BY <2>5, <2>10
-    <3>3. txnHistory[i] \in Range(txnHistory)
-      BY <2>2, <2>10 DEF Range
-    <3>4. txnHistory[i].txnId = tid
-      BY <3>1, <3>2
-    <3>. QED
-      BY <1>7, <3>3, <3>4
-  <2>11. CASE i \in {Len(txnHistory)+1, Len(txnHistory)+2} /\ j \in {Len(txnHistory)+1, Len(txnHistory)+2}
-    <3>1. CASE i = j
-      BY <3>1
-    <3>2. CASE i # j
-      <4>1. CASE i = Len(txnHistory)+1
-        <5>1. j = Len(txnHistory)+2
-          BY <2>11, <3>2, <4>1
-        <5>2. txnHistory'[i].type = "begin"
-          BY <2>6, <4>1, <1>5
-        <5>3. txnHistory'[j].type = "body"
-          BY <2>7, <5>1, <1>5
-        <5>. QED
-          BY <5>2, <5>3
-      <4>2. CASE i = Len(txnHistory)+2
-        <5>1. j = Len(txnHistory)+1
-          BY <2>11, <3>2, <4>2
-        <5>2. txnHistory'[i].type = "body"
-          BY <2>7, <4>2, <1>5
-        <5>3. txnHistory'[j].type = "begin"
-          BY <2>6, <5>1, <1>5
-        <5>. QED
-          BY <5>2, <5>3
-      <4>. QED
-        BY <2>11, <4>1, <4>2
-    <3>. QED
-      BY <3>1, <3>2
-  <2>. QED
-    BY <2>1, <2>2, <2>8, <2>9, <2>10, <2>11
-<1>14. TimesMono'
-  <2> SUFFICES ASSUME NEW i \in DOMAIN txnHistory', NEW j \in DOMAIN txnHistory',
-                      i < j,
-                      txnHistory'[i].type \in {"begin", "commit", "abort"},
-                      txnHistory'[j].type \in {"begin", "commit", "abort"}
-               PROVE  txnHistory'[i].time < txnHistory'[j].time
-    BY DEF TimesMono
-  <2>1. DOMAIN txnHistory = 1..Len(txnHistory)
-    BY <1>2, LenProperties
-  <2>2. <<beginOp, bodyOp>> \in Seq(S \cup {beginOp, bodyOp})
-    BY PairSeq, SeqMonotonic
-  <2>3. \A ii \in DOMAIN txnHistory : txnHistory'[ii] = txnHistory[ii]
-    BY <1>1, <1>2, <2>2, ConcatProperties, LenProperties
-  <2>4. txnHistory'[Len(txnHistory)+1] = beginOp
-    BY <1>1, <1>2, <2>2, ConcatProperties, LenProperties
-  <2>5. txnHistory'[Len(txnHistory)+2] = bodyOp
-    BY <1>1, <1>2, <2>2, ConcatProperties, LenProperties
-  <2>6. CASE j \in DOMAIN txnHistory
-    <3>1. i \in DOMAIN txnHistory
-      BY <1>1, <1>2, <2>6, ConcatProperties, LenProperties
-    <3>. QED
-      BY <2>3, <3>1, <2>6 DEF Inv, TimesMono
-  <2>7. CASE j = Len(txnHistory)+1
-    <3>1. i \in DOMAIN txnHistory
-      BY <2>7, <1>2, LenProperties
-    <3>2. txnHistory'[i] = txnHistory[i]
-      BY <2>3, <3>1
-    <3>3. txnHistory[i] \in Range(txnHistory)
-      BY <3>1 DEF Range
-    <3>4. txnHistory[i].time <= clock
-      BY <3>2, <3>3 DEF Inv, TimesVsClock, OpShape
-    <3>5. txnHistory[i].time \in Nat
-      BY <3>2, <3>3 DEF Inv, OpShape
-    <3>. QED
-      BY <2>4, <2>7, <3>2, <3>4, <3>5, <1>5, <1>6
-  <2>8. CASE j = Len(txnHistory)+2
-    <3>1. txnHistory'[j] = bodyOp
-      BY <2>5, <2>8
-    <3>. QED
-      BY <1>5, <3>1
-  <2>. QED
-    BY <1>1, <1>2, <1>3, <2>1, <2>6, <2>7, <2>8, ConcatProperties, LenProperties, PairSeq, SeqMonotonic
-<1>15. TimesVsClock'
-  <2> SUFFICES ASSUME NEW op \in Range(txnHistory'),
-                      op.type \in {"begin", "commit", "abort"}
-               PROVE  op.time <= clock'
-    BY DEF TimesVsClock
-  <2>1. CASE op \in Range(txnHistory)
-    <3>1. op.time <= clock
-      BY <2>1 DEF Inv, TimesVsClock
-    <3>2. op.time \in Nat
-      BY <2>1 DEF Inv, OpShape
-    <3>. QED
-      BY <1>1, <1>6, <3>1, <3>2
-  <2>2. CASE op = beginOp
-    BY <1>1, <1>5, <1>6, <2>2
-  <2>3. CASE op = bodyOp
-    BY <1>5, <2>3
-  <2>. QED
-    BY <1>4, <2>1, <2>2, <2>3
-<1>16. OrderOK'
-  <2> DEFINE T == S \cup {beginOp, bodyOp}
-  <2>1. <<beginOp, bodyOp>> \in Seq(T)
-    BY PairSeq, SeqMonotonic
-  <2>2. \A ii \in DOMAIN txnHistory : txnHistory'[ii] = txnHistory[ii]
-    BY <1>1, <1>2, <2>1, ConcatProperties, LenProperties
-  <2>3. txnHistory'[Len(txnHistory)+1] = beginOp
-    BY <1>1, <1>2, <2>1, ConcatProperties, LenProperties
-  <2>4. txnHistory'[Len(txnHistory)+2] = bodyOp
-    BY <1>1, <1>2, <2>1, ConcatProperties, LenProperties
-  <2>5. \A i, j \in DOMAIN txnHistory' :
-           txnHistory'[i].txnId = txnHistory'[j].txnId
-           /\ txnHistory'[i].type = "begin"
-           /\ txnHistory'[j].type \in {"body", "commit", "abort"}
-           => i < j
-    <3> SUFFICES ASSUME NEW i \in DOMAIN txnHistory', NEW j \in DOMAIN txnHistory',
-                        txnHistory'[i].txnId = txnHistory'[j].txnId,
-                        txnHistory'[i].type = "begin",
-                        txnHistory'[j].type \in {"body", "commit", "abort"}
-                 PROVE  i < j
-      OBVIOUS
-    <3>1. CASE i \in DOMAIN txnHistory /\ j \in DOMAIN txnHistory
-      BY <2>2, <3>1 DEF Inv, OrderOK
-    <3>2. CASE i \in DOMAIN txnHistory /\ j \notin DOMAIN txnHistory
-      <4>1. txnHistory'[i] = txnHistory[i]
-        BY <2>2, <3>2
-      <4>2. txnHistory[i] \in Range(txnHistory)
-        BY <3>2 DEF Range
-      <4>3. j = Len(txnHistory)+1 \/ j = Len(txnHistory)+2
-        BY <1>1, <1>2, <1>3, <3>2, NewConcatIndex
-      <4>4. txnHistory'[j].txnId = tid
-        BY <4>3, <1>5, <2>3, <2>4
-      <4>5. txnHistory[i].txnId = tid
-        BY <4>1, <4>4
-      <4>. QED
-        BY <1>7, <4>2, <4>5
-    <3>3. CASE i \notin DOMAIN txnHistory
-      <4>1. i = Len(txnHistory)+1 \/ i = Len(txnHistory)+2
-        BY <1>1, <1>2, <1>3, <3>3, NewConcatIndex
-      <4>2. i # Len(txnHistory)+2
-        BY <1>5, <2>4
-      <4>3. i = Len(txnHistory)+1
-        BY <4>1, <4>2
-      <4>4. CASE j \in DOMAIN txnHistory
-        <5>1. txnHistory'[j] \in Range(txnHistory)
-          BY <2>2, <4>4 DEF Range
-        <5>2. txnHistory'[j].txnId = tid
-          BY <1>5, <2>3, <4>3
-        <5>. QED
-          BY <1>7, <5>1, <5>2
-      <4>5. CASE j = Len(txnHistory)+2
-        <5>1. Len(txnHistory) \in Nat
-          BY <1>2, LenProperties
-        <5>. QED
-          BY <4>3, <4>5, <5>1
-      <4>6. j \in DOMAIN txnHistory \/ j = Len(txnHistory)+2
-        BY <1>1, <1>2, ConcatProperties, LenProperties
-      <4>. QED
-        BY <4>4, <4>5, <4>6
-    <3>. QED
-      BY <3>1, <3>2, <3>3
-  <2>6. \A i, j \in DOMAIN txnHistory' :
-           txnHistory'[i].txnId = txnHistory'[j].txnId
-           /\ txnHistory'[i].type = "body"
-           /\ txnHistory'[j].type \in {"commit", "abort"}
-           => i < j
-    <3> SUFFICES ASSUME NEW i \in DOMAIN txnHistory', NEW j \in DOMAIN txnHistory',
-                        txnHistory'[i].txnId = txnHistory'[j].txnId,
-                        txnHistory'[i].type = "body",
-                        txnHistory'[j].type \in {"commit", "abort"}
-                 PROVE  i < j
-      OBVIOUS
-    <3>1. CASE i \in DOMAIN txnHistory /\ j \in DOMAIN txnHistory
-      BY <2>2, <3>1 DEF Inv, OrderOK
-    <3>2. CASE j \notin DOMAIN txnHistory
-      <4>1. j = Len(txnHistory)+1 \/ j = Len(txnHistory)+2
-        BY <1>1, <1>2, <1>3, <3>2, NewConcatIndex
-      <4>2. txnHistory'[j].type \in {"begin", "body"}
-        BY <4>1, <1>5, <2>3, <2>4
-      <4>. QED
-        BY <4>2
-    <3>3. CASE i \notin DOMAIN txnHistory /\ j \in DOMAIN txnHistory
-      <4>1. txnHistory'[j] \in Range(txnHistory)
-        BY <2>2, <3>3 DEF Range
-      <4>2. i = Len(txnHistory)+1 \/ i = Len(txnHistory)+2
-        BY <1>1, <1>2, <1>3, <3>3, NewConcatIndex
-      <4>3. txnHistory'[i].txnId = tid
-        BY <4>2, <1>5, <2>3, <2>4
-      <4>. QED
-        BY <1>7, <4>1, <4>3
-    <3>. QED
-      BY <3>1, <3>2, <3>3
-  <2>. QED
-    BY <2>5, <2>6 DEF OrderOK
-<1>17. CommitHasPreds'
-  <2> SUFFICES ASSUME NEW c \in Range(txnHistory'), c.type = "commit"
-               PROVE  /\ \E b \in Range(txnHistory') : b.type = "begin" /\ b.txnId = c.txnId
-                      /\ \E d \in Range(txnHistory') : d.type = "body"  /\ d.txnId = c.txnId
-    BY DEF CommitHasPreds
-  <2>1. c \in Range(txnHistory)
-    BY <1>4, <1>5
-  <2>. QED
-    BY <1>4, <2>1 DEF Inv, CommitHasPreds
-<1>18. AbortHasPreds'
-  <2> SUFFICES ASSUME NEW a \in Range(txnHistory'), a.type = "abort"
-               PROVE  /\ \E b \in Range(txnHistory') : b.type = "begin" /\ b.txnId = a.txnId
-                      /\ \E d \in Range(txnHistory') : d.type = "body"  /\ d.txnId = a.txnId
-    BY DEF AbortHasPreds
-  <2>1. a \in Range(txnHistory)
-    BY <1>4, <1>5
-  <2>. QED
-    BY <1>4, <2>1 DEF Inv, AbortHasPreds
-<1>19. H1inv'
-  <2> SUFFICES ASSUME NEW b \in Range(txnHistory'), NEW c \in Range(txnHistory'),
-                      b.type = "begin", c.type = "commit", b.txnId = c.txnId
-               PROVE  b.time < c.time
-    BY DEF H1inv
-  <2>1. b \in Range(txnHistory) \cup {beginOp} /\ c \in Range(txnHistory)
-    BY <1>4, <1>5
-  <2>2. CASE b \in Range(txnHistory)
-    BY <2>1, <2>2 DEF Inv, H1inv
-  <2>3. CASE b = beginOp
-    <3>1. c.txnId = tid
-      BY <1>5, <2>3
-    <3>. QED
-      BY <1>7, <2>1, <3>1
-  <2>. QED
-    BY <2>1, <2>2, <2>3
-<1>20. H2inv'
-  <2> SUFFICES ASSUME NEW d \in Range(txnHistory'), d.type = "body"
-               PROVE  BodyH2(d)
-    BY DEF H2inv
-  <2>1. CASE d \in Range(txnHistory)
-    BY <2>1 DEF Inv, H2inv
-  <2>2. CASE d = bodyOp
-    <3>1. BodyH2(bodyOp)
-      BY <1>5, <1>8 DEF BodyH2
-    <3>. QED
-      BY <2>2, <3>1
-  <2>. QED
-    BY <1>4, <2>1, <2>2
-<1>21. NoWriteROinv'
-  <2> SUFFICES ASSUME NEW op \in Range(txnHistory'), op.type = "body",
-                      NEW w \in op.writes
-               PROVE  ~ReadOnlyCol(w.key)
-    BY DEF NoWriteROinv, NoWriteRO
-  <2>1. CASE op \in Range(txnHistory)
-    BY <2>1 DEF Inv, NoWriteROinv, NoWriteRO
-  <2>2. CASE op = bodyOp
-    BY <1>5, <2>2, WorkloadNoROWrite
-  <2>. QED
-    BY <1>4, <2>1, <2>2
-<1>22. H3inv'
-  <2> SUFFICES ASSUME NEW c1 \in Range(txnHistory'), NEW c2 \in Range(txnHistory'),
-                      c1.type = "commit", c2.type = "commit",
-                      c1.txnId # c2.txnId,
-                      SI!KeysWrittenByTxn(txnHistory', c1.txnId)
-                        \cap SI!KeysWrittenByTxn(txnHistory', c2.txnId) # {},
-                      NEW b1 \in Range(txnHistory'), NEW b2 \in Range(txnHistory'),
-                      b1.type = "begin", b1.txnId = c1.txnId,
-                      b2.type = "begin", b2.txnId = c2.txnId
-               PROVE  c1.time < b2.time \/ c2.time < b1.time
-    BY DEF H3inv
-  <2>1. c1 \in Range(txnHistory) /\ c2 \in Range(txnHistory)
-    BY <1>4, <1>5
-  <2>2. c1.txnId # tid /\ c2.txnId # tid
-    BY <1>7, <2>1
-  <2>3. SI!KeysWrittenByTxn(txnHistory', c1.txnId) = SI!KeysWrittenByTxn(txnHistory, c1.txnId)
-    BY <1>1, <1>2, <1>5, <2>2, KeysWrittenUnchangedConcatOther
-  <2>4. SI!KeysWrittenByTxn(txnHistory', c2.txnId) = SI!KeysWrittenByTxn(txnHistory, c2.txnId)
-    BY <1>1, <1>2, <1>5, <2>2, KeysWrittenUnchangedConcatOther
-  <2>5. CASE b1 \in Range(txnHistory) /\ b2 \in Range(txnHistory)
-    BY <2>1, <2>3, <2>4, <2>5 DEF Inv, H3inv
-  <2>6. CASE b1 = beginOp
-    BY <1>5, <2>2, <2>6
-  <2>7. CASE b2 = beginOp
-    BY <1>5, <2>2, <2>7
-  <2>8. CASE b1 = bodyOp
-    BY <1>5, <2>8
-  <2>9. CASE b2 = bodyOp
-    BY <1>5, <2>9
-  <2>. QED
-    BY <1>4, <2>5, <2>6, <2>7, <2>8, <2>9
-<1>23. CommitKeys'
-  <2> SUFFICES ASSUME NEW c \in Range(txnHistory'), c.type = "commit"
-               PROVE  c.updatedKeys = SI!KeysWrittenByTxn(txnHistory', c.txnId)
-    BY DEF CommitKeys
-  <2>1. c \in Range(txnHistory)
-    BY <1>4, <1>5
-  <2>2. c.txnId # tid
-    BY <1>7, <2>1
-  <2>3. c.updatedKeys = SI!KeysWrittenByTxn(txnHistory, c.txnId)
-    BY <2>1 DEF Inv, CommitKeys
-  <2>4. SI!KeysWrittenByTxn(txnHistory', c.txnId) = SI!KeysWrittenByTxn(txnHistory, c.txnId)
-    BY <1>1, <1>2, <1>5, <2>2, KeysWrittenUnchangedConcatOther
-  <2>. QED
-    BY <2>3, <2>4
-<1>24. RunningOK'
-  <2>1. newTxn \in [id : TxnIds, startTime : Nat, commitTime : {Empty}]
-    BY <1>6
-  <2>2. runningTxns' \subseteq [id : TxnIds, startTime : Nat, commitTime : {Empty}]
-    BY <1>1, <2>1 DEF Inv, RunningOK
-  <2>3. \A txn \in runningTxns' :
-           /\ \E b \in Range(txnHistory') :
-                 b.type = "begin" /\ b.txnId = txn.id /\ b.time = txn.startTime
-           /\ \E d \in Range(txnHistory') : d.type = "body" /\ d.txnId = txn.id
-           /\ ~\E c \in Range(txnHistory') : c.type \in {"commit", "abort"} /\ c.txnId = txn.id
-    <3> SUFFICES ASSUME NEW txn \in runningTxns'
-                 PROVE  /\ \E b \in Range(txnHistory') :
-                              b.type = "begin" /\ b.txnId = txn.id /\ b.time = txn.startTime
-                        /\ \E d \in Range(txnHistory') : d.type = "body" /\ d.txnId = txn.id
-                        /\ ~\E c \in Range(txnHistory') : c.type \in {"commit", "abort"} /\ c.txnId = txn.id
-      OBVIOUS
-    <3>1. CASE txn \in runningTxns
-      <4>1. txn.id # tid
-        BY <1>7, <3>1 DEF Inv, RunningOK
-      <4>2. \E b \in Range(txnHistory) :
-              b.type = "begin" /\ b.txnId = txn.id /\ b.time = txn.startTime
-            /\ \E d \in Range(txnHistory) : d.type = "body" /\ d.txnId = txn.id
-            /\ ~\E c \in Range(txnHistory) : c.type \in {"commit", "abort"} /\ c.txnId = txn.id
-        BY <3>1, RunningHasBeginBody
-      <4>3. ~\E c \in Range(txnHistory') : c.type \in {"commit", "abort"} /\ c.txnId = txn.id
-        BY <1>4, <1>5, <4>1, <4>2
-      <4>. QED
-        BY <1>4, <4>2, <4>3
-    <3>2. CASE txn = newTxn
-      <4>1. beginOp \in Range(txnHistory') /\ bodyOp \in Range(txnHistory')
-        BY <1>4
-      <4>2. ~\E c \in Range(txnHistory') : c.type \in {"commit", "abort"} /\ c.txnId = tid
-        BY <1>4, <1>5, <1>7
-      <4>. QED
-        BY <1>5, <3>2, <4>1, <4>2
-    <3>. QED
-      BY <1>1, <3>1, <3>2
-  <2>4. \A t1, t2 \in runningTxns' : t1.id = t2.id => t1 = t2
-    <3> SUFFICES ASSUME NEW t1 \in runningTxns', NEW t2 \in runningTxns', t1.id = t2.id
-                 PROVE  t1 = t2
-      OBVIOUS
-    <3>1. CASE t1 \in runningTxns /\ t2 \in runningTxns
-      BY <3>1 DEF Inv, RunningOK
-    <3>2. CASE t1 = newTxn
-      <4>1. t2.id = tid
-        BY <3>2
-      <4>2. t2 \notin runningTxns
-        BY <1>7, <4>1 DEF Inv, RunningOK
-      <4>. QED
-        BY <1>1, <3>2, <4>2
-    <3>3. CASE t2 = newTxn
-      <4>1. t1.id = tid
-        BY <3>3
-      <4>2. t1 \notin runningTxns
-        BY <1>7, <4>1 DEF Inv, RunningOK
-      <4>. QED
-        BY <1>1, <3>3, <4>2
-    <3>. QED
-      BY <1>1, <3>1, <3>2, <3>3
-  <2>. QED
-    BY <2>2, <2>3, <2>4 DEF RunningOK
-<1>. QED
-  BY <1>10, <1>11, <1>12, <1>13, <1>14, <1>15, <1>16, <1>17, <1>18,
-     <1>19, <1>20, <1>21, <1>22, <1>23, <1>24
-  DEF Inv
-
------------------------------------------------------------------------------
-(*****************************************************************************)
-(* 13. Next and assembly                                                     *)
-(*****************************************************************************)
-
-LEMMA NextInv ==
-  ASSUME Inv, Next
-  PROVE  Inv'
-<1>1. CASE \E tid \in TxnIds, req \in Requests : StartAndRun(tid, req)
-  BY <1>1, StartInv
-<1>2. CASE \E tid \in TxnIds : CommitTxn(tid)
-  BY <1>2, CommitInv
-<1>3. CASE \E tid \in TxnIds : AbortTxn(tid)
-  BY <1>3, AbortInv
-<1>4. CASE AllTxnsDone /\ UNCHANGED vars
-  BY <1>4, UnchangedInv
-<1>. QED
-  BY <1>1, <1>2, <1>3, <1>4 DEF Next
-
-LEMMA InvInductive ==
-  ASSUME Inv, [Next]_vars
-  PROVE  Inv'
-<1>1. CASE Next
-  BY <1>1, NextInv
-<1>2. CASE UNCHANGED vars
-  BY <1>2, UnchangedInv
-<1>. QED
-  BY <1>1, <1>2
-
-THEOREM Safety == Spec => []SerializableViaPath
-<1>1. Init => Inv
-  BY InitInv
-<1>2. Inv /\ [Next]_vars => Inv'
-  BY InvInductive
-<1>3. Inv => SerializableViaPath
-  BY InvSerializable
-<1>. QED
-  BY <1>1, <1>2, <1>3, PTL DEF Spec
+THEOREM Safety ==
+    Spec => []SerializableViaPath
+  <1>1. Init => Inv
+    BY InitInv
+  <1>2. Inv /\ [Next]_vars => Inv'
+    BY NextInv
+  <1>3. Inv => SerializableViaPath
+    BY InvSerializable
+  <1> QED
+    BY <1>1, <1>2, <1>3, PTL DEF Spec
 
 =============================================================================
-
